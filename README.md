@@ -69,7 +69,15 @@ Na primeira sincronização de um perfil grande, limite o lote:
 python download_instagram.py --max 20
 ```
 
-Ao terminar, o script imprime `downloaded / skipped / failed` e sai com código `1` se algum download falhou. 429 e erros de rede tentam de novo (padrão: 3 retries).
+Ao terminar, o script imprime `downloaded / skipped / failed` e sai com código `1` se algum download falhou. 429 e erros de rede tentam de novo (padrão: 3 retries). Linhas inválidas em `profiles.txt` são puladas com warning — não abortam a execução.
+
+## Resume de varredura profunda
+
+`--full` salva a posição da paginação em `data/cursors.json` depois de cada página consumida. Se a varredura for interrompida (Ctrl+C sai com código 130, `--max`, crash), a próxima `--full` do mesmo perfil retoma do ponto salvo em vez de recomeçar do topo. Quando uma aba termina naturalmente, o cursor dela é apagado. Varreduras sem `--full` ignoram cursors; para recomeçar do topo, apague o arquivo.
+
+## Metadados
+
+`--write-metadata` grava um sidecar `<arquivo>.mp4.json` ao lado de cada vídeo baixado, com id, URLs, data e pinned. Só no downloader nativo — no modo yt-dlp use o `--write-info-json` do próprio yt-dlp.
 
 ## yt-dlp (opcional)
 
@@ -88,6 +96,7 @@ python download_instagram.py --downloader yt-dlp
 python download_instagram.py --dry-run
 python download_instagram.py --reels-only
 python download_instagram.py --max 20 --retries 5
+python download_instagram.py --full --write-metadata
 python download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 ```
 
@@ -96,5 +105,6 @@ python download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 ## Notas
 
 - Cookies de conta logada em automação podem levar a bloqueio. Prefira uma sessão que você aceite perder.
-- Não commite `cookies.txt`.
-- Se o Instagram responder login/rate-limit, atualize os cookies e aumente `--request-sleep`.
+- Não commite `cookies.txt`. O script aplica chmod 600 nele (export do browser e leitura).
+- O app-id do Instagram muda de vez em quando. Se os endpoints começarem a falhar em massa, atualize com `--ig-app-id` ou a env `IG_APP_ID`.
+- Se o Instagram responder login/rate-limit, atualize os cookies e aumente `--request-sleep` (que já vai com ±25% de jitter).

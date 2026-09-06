@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import random
 import re
 import secrets
 import shutil
@@ -20,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
-from typing import TypeVar, Union
+from typing import BinaryIO, TypeVar, Union
 
 LOG = logging.getLogger("igdown")
 T = TypeVar("T")
@@ -63,6 +65,7 @@ RESERVED_PATHS = {
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mkv", ".mov"}
 RETRYABLE_HTTP = frozenset({429, 500, 502, 503})
+CDN_HOST_RE = re.compile(r"^(?:[a-z0-9-]+\.)*(?:cdninstagram\.com|fbcdn\.net)$")
 
 
 class InstagramError(Exception):
@@ -89,6 +92,35 @@ class DirectMedia:
 @dataclass(frozen=True)
 class Profile:
     username: str
+
+
+Entry = Union[DirectMedia, Profile]  # noqa: UP007 (runtime alias; keeps py3.9 imports working)
+
+
+def is_safe_username(name: str) -> bool:
+    """Usernames become folder names; reject path-ish or all-dot values."""
+    return bool(USERNAME_RE.fullmatch(name)) and bool(re.search(r"[A-Za-z0-9]", name))
+
+
+def is_safe_media_url(url: str) -> bool:
+    """Media URLs come from API JSON; only Instagram CDN HTTPS is allowed."""
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" and bool(CDN_HOST_RE.fullmatch(parsed.hostname or ""))
+
+
+def jittered(seconds: float) -> float:
+    """±25% jitter so a fixed request cadence looks less bot-like."""
+    return seconds * random.uniform(0.75, 1.25)
+
+
+def looks_like_login_page(final_url: str, body: str) -> bool:
+    """gallery-dl aborts on /accounts/login and /challenge redirects; so do we."""
+    head = body[:200].lstrip().lower()
+    return (
+        "/accounts/login" in final_url
+        or "/challenge" in final_url
+        or head.startswith(("<!doctype", "<html"))
+    )
 
 
 @dataclass(frozen=True)
@@ -150,11 +182,13 @@ def parse_line(raw: str) -> Entry | None:
         username = profile.group(1).rstrip("/")
         if username.lower() in RESERVED_PATHS:
             raise InstagramError("invalid_entry", f"Not a profile or media URL: {line}")
+        if not is_safe_username(username):
+            raise InstagramError("invalid_entry", f"Unsafe username in URL: {line}")
         return Profile(username=username)
 
-    if USERNAME_RE.fullmatch(line.lstrip("@")):
-        return Profile(username=line.lstrip("@"))
-
+    name = line.lstrip("@")
+    if is_safe_username(name):
+        return Profile(username=name)
     raise InstagramError("invalid_entry", f"Not a profile or media URL: {line}")
 
 
@@ -163,12 +197,16 @@ def parse_profile_file(path: Path) -> list[Entry]:
         raise InstagramError("profiles_not_found", f"Profiles file not found: {path}")
 
     entries: list[Entry] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        entry = parse_line(raw)
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        try:
+            entry = parse_line(raw)
+        except InstagramError as exc:
+            LOG.warning("Skipping line %s: %s", lineno, exc)
+            continue
         if entry is not None:
             entries.append(entry)
     if not entries:
-        raise InstagramError("empty_profiles", f"No profiles or URLs in {path}")
+        raise InstagramError("empty_profiles", f"No valid profiles or URLs in {path}")
     return entries
 
 
@@ -190,6 +228,9 @@ def video_id_from_filename(path: Path) -> str | None:
 
 
 def parse_retry_after(raw: str | None) -> float | None:
+    # Ceiling: only the integer-seconds form is honored; HTTP-date responses are
+    # treated as absent and fall back to exponential backoff. Upgrade path:
+    # email.utils.parsedate_to_datetime, if Instagram ever sends dates here.
     if not raw:
         return None
     try:
@@ -243,14 +284,9 @@ def call_with_retry(
     raise last_error
 
 
-def should_stop_after_existing(
-    consecutive_known: int,
-    *,
-    pinned: bool,
-    full: bool,
-    threshold: int,
-) -> bool:
-    if pinned or full or threshold <= 0:
+def should_stop_after_existing(consecutive_known: int, *, full: bool, threshold: int) -> bool:
+    """True when a tab scan should stop (pinned videos never increment the counter)."""
+    if full or threshold <= 0:
         return False
     return consecutive_known >= threshold
 
@@ -279,6 +315,9 @@ class SkipStore:
         self._ids.add(video_id)
 
     def remember(self, video_id: str) -> None:
+        if not SHORTCODE_RE.fullmatch(video_id):
+            LOG.warning("Refusing to archive malformed id %r", video_id[:60])
+            return
         if video_id in self._ids:
             return
         self.mark(video_id)
@@ -294,6 +333,54 @@ class SkipStore:
             video_id = video_id_from_filename(file_path)
             if video_id:
                 self.remember(video_id)
+
+
+class CursorStore:
+    """Persists pagination cursors so interrupted --full scans resume where they stopped."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._data: dict[str, str] = {}
+
+    def load(self) -> None:
+        if not self.path.is_file():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            LOG.warning("Ignoring corrupt cursor file %s", self.path)
+            return
+        if isinstance(data, dict):
+            self._data = {str(key): str(value) for key, value in data.items()}
+
+    def get(self, key: str) -> str | None:
+        return self._data.get(key)
+
+    def set(self, key: str, value: str | None) -> None:
+        if value is None:
+            self._data.pop(key, None)
+        else:
+            self._data[key] = value
+        self._save()
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self._data, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(self.path)
+
+
+def restrict_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        LOG.warning("Could not restrict permissions on %s", path)
+
+
+def open_part_file(path: Path) -> BinaryIO:
+    """Create/truncate a .part file without following a pre-planted symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    return os.fdopen(os.open(path, flags, 0o600), "wb")
 
 
 def find_yt_dlp() -> list[str]:
@@ -330,6 +417,8 @@ def export_browser_cookies(yt_dlp: list[str], browser: str, dest: Path) -> None:
     ]
     LOG.info("Exporting cookies from browser %s", browser)
     result = subprocess.run(cmd, check=False)
+    if dest.is_file():
+        restrict_permissions(dest)
     if result.returncode != 0 and not dest.is_file():
         raise InstagramError(
             "cookie_export_failed",
@@ -340,7 +429,15 @@ def export_browser_cookies(yt_dlp: list[str], browser: str, dest: Path) -> None:
 class InstagramClient:
     """Lists profile videos through Instagram web API endpoints used by gallery-dl."""
 
-    def __init__(self, cookies_path: Path, request_sleep: float, retries: int = 3) -> None:
+    def __init__(
+        self,
+        cookies_path: Path,
+        request_sleep: float,
+        retries: int = 3,
+        *,
+        app_id: str = IG_WEB_APP_ID,
+        cursors: CursorStore | None = None,
+    ) -> None:
         if not cookies_path.is_file():
             raise InstagramError(
                 "cookies_required",
@@ -349,15 +446,25 @@ class InstagramClient:
             )
         self.request_sleep = request_sleep
         self.retries = retries
+        self.app_id = app_id
+        self.cursors = cursors
         self._www_claim = "0"
+        self._requests_made = 0
         self._user_ids: dict[str, str] = {}
         self._jar = MozillaCookieJar(str(cookies_path))
-        self._jar.load(ignore_discard=True, ignore_expires=True)
+        try:
+            self._jar.load(ignore_discard=True, ignore_expires=True)
+        except OSError as exc:
+            raise InstagramError(
+                "cookies_invalid",
+                f"Could not read cookies file {cookies_path}: {exc}",
+            ) from exc
         if not any(cookie.name == "sessionid" for cookie in self._jar):
             raise InstagramError(
                 "cookies_required",
                 "cookies.txt has no Instagram sessionid. Log in on the browser and export again.",
             )
+        restrict_permissions(cookies_path)
         self._ensure_csrf()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self._jar),
@@ -400,7 +507,7 @@ class InstagramClient:
             "Accept": "*/*",
             "User-Agent": CHROME_UA,
             "X-CSRFToken": self._csrf(),
-            "X-IG-App-ID": IG_WEB_APP_ID,
+            "X-IG-App-ID": self.app_id,
             "X-ASBD-ID": "129477",
             "X-IG-WWW-Claim": self._www_claim,
             "X-Requested-With": "XMLHttpRequest",
@@ -437,13 +544,17 @@ class InstagramClient:
         if params:
             request_url = f"{url}?{urllib.parse.urlencode(params)}"
         data = urllib.parse.urlencode(form).encode() if form is not None else None
+        if self.request_sleep > 0 and self._requests_made:
+            time.sleep(jittered(self.request_sleep))
+        self._requests_made += 1
         req = urllib.request.Request(request_url, data=data, headers=self._headers())
         try:
             with self._opener.open(req, timeout=30) as resp:
                 claim = resp.headers.get("x-ig-set-www-claim")
                 if claim:
                     self._www_claim = claim
-                payload = json.loads(resp.read().decode("utf-8"))
+                body = resp.read().decode("utf-8", errors="replace")
+                final_url = resp.geturl()
         except urllib.error.HTTPError as exc:
             retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
             if exc.code in {401, 403}:
@@ -461,12 +572,19 @@ class InstagramClient:
         except urllib.error.URLError as exc:
             raise InstagramError("instagram_network", f"Network error: {exc.reason}") from exc
 
+        if looks_like_login_page(final_url, body):
+            raise InstagramError(
+                "instagram_auth_required",
+                "Instagram redirected to a login/challenge page. Refresh cookies and retry.",
+            )
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise InstagramError("instagram_api", "Instagram returned a non-JSON response") from exc
         if isinstance(payload, dict) and payload.get("status") == "fail":
             message = str(payload.get("message") or "request failed")
             code = "instagram_auth_required" if "login" in message.lower() else "instagram_api"
             raise InstagramError(code, message)
-        if self.request_sleep > 0:
-            time.sleep(self.request_sleep)
         return payload
 
     def user_id(self, username: str) -> str:
@@ -532,12 +650,30 @@ class InstagramClient:
     def iter_feed_videos(self, username: str) -> Iterator[ListedVideo]:
         yield from self._iter_feed_videos(self.user_id(username), username)
 
+    def _apply_cursor(self, key: str, target: dict[str, str]) -> None:
+        if self.cursors is None:
+            return
+        saved = self.cursors.get(key)
+        if saved:
+            target["max_id"] = saved
+            LOG.info("Resuming %s from saved cursor", key)
+
+    def _save_cursor(self, key: str, more_available: object, max_id: object) -> None:
+        if self.cursors is None:
+            return
+        if more_available and max_id:
+            self.cursors.set(key, str(max_id))
+        else:
+            self.cursors.set(key, None)
+
     def _iter_clips(self, user_id: str, username: str) -> Iterator[ListedVideo]:
+        key = f"{username.lower()}:reels"
         form = {
             "target_user_id": user_id,
             "page_size": "50",
             "include_feed_video": "true",
         }
+        self._apply_cursor(key, form)
         while True:
             data = self._request(f"{IG_ORIGIN}/api/v1/clips/user/", form=form)
             for item in data.get("items") or []:
@@ -545,6 +681,7 @@ class InstagramClient:
                 if video:
                     yield video
             info = data.get("paging_info") or {}
+            self._save_cursor(key, info.get("more_available"), info.get("max_id"))
             if not info.get("more_available"):
                 return
             max_id = info.get("max_id")
@@ -553,7 +690,9 @@ class InstagramClient:
             form["max_id"] = str(max_id)
 
     def _iter_feed_videos(self, user_id: str, username: str) -> Iterator[ListedVideo]:
+        key = f"{username.lower()}:feed"
         params = {"count": "30"}
+        self._apply_cursor(key, params)
         while True:
             data = self._request(
                 f"{IG_ORIGIN}/api/v1/feed/user/{user_id}/",
@@ -563,6 +702,7 @@ class InstagramClient:
                 video = listed_video_from_media(item, username, kind="feed")
                 if video:
                     yield video
+            self._save_cursor(key, data.get("more_available"), data.get("next_max_id"))
             if not data.get("more_available"):
                 return
             max_id = data.get("next_max_id")
@@ -579,6 +719,8 @@ class InstagramClient:
         return items[0]
 
     def download_url(self, url: str, dest: Path) -> None:
+        if not is_safe_media_url(url):
+            raise InstagramError("unsafe_media_url", f"Refusing non-CDN URL for {dest.name}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             return
@@ -600,7 +742,7 @@ class InstagramClient:
             },
         )
         try:
-            with self._opener.open(req, timeout=120) as resp, tmp.open("wb") as handle:
+            with self._opener.open(req, timeout=120) as resp, open_part_file(tmp) as handle:
                 shutil.copyfileobj(resp, handle)
         except urllib.error.HTTPError as exc:
             if tmp.exists():
@@ -659,6 +801,8 @@ def video_urls_from_media(media: dict) -> tuple[str, ...]:
 
 def media_taken_at(media: dict) -> int | None:
     raw = media.get("taken_at") or media.get("device_timestamp")
+    if raw is None:
+        return None
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -707,9 +851,13 @@ def listed_video_from_media(
     if not is_video:
         return None
     video_id = str(media.get("code") or media.get("shortcode") or "")
-    if not video_id:
+    if not SHORTCODE_RE.fullmatch(video_id):
+        LOG.warning("Skipping media with unsafe id %r", video_id[:60])
         return None
     owner = (media.get("user") or {}).get("username") or username
+    if not is_safe_username(owner):
+        LOG.warning("Skipping %s with unsafe owner %r", video_id, owner[:60])
+        return None
     pinned = bool(
         media.get("timeline_pinned_user_ids") or media.get("clips_tab_pinned_user_ids")
     )
@@ -739,7 +887,13 @@ def native_destinations(download_dir: Path, video: ListedVideo) -> list[Path]:
     ]
 
 
-def download_native(client: InstagramClient, video: ListedVideo, download_dir: Path) -> bool:
+def download_native(
+    client: InstagramClient,
+    video: ListedVideo,
+    download_dir: Path,
+    *,
+    write_metadata: bool = False,
+) -> bool:
     if not video.file_urls:
         LOG.warning("No CDN URL for %s", video.video_id)
         return False
@@ -747,12 +901,31 @@ def download_native(client: InstagramClient, video: ListedVideo, download_dir: P
     try:
         for url, dest in zip(video.file_urls, native_destinations(download_dir, video), strict=True):
             client.download_url(url, dest)
+            if write_metadata:
+                write_metadata_file(dest, video, url)
     except InstagramError as exc:
-        if exc.code not in {"download_failed", "instagram_network"}:
+        if exc.code not in {"download_failed", "instagram_network", "unsafe_media_url"}:
             raise
         LOG.error("%s [%s]", exc, exc.code)
         return False
     return True
+
+
+def write_metadata_file(dest: Path, video: ListedVideo, media_url: str) -> None:
+    """Write a .json sidecar next to each downloaded file (instaloader-style)."""
+    meta = {
+        "id": video.video_id,
+        "page_url": video.url,
+        "media_url": media_url,
+        "username": video.username,
+        "kind": video.kind,
+        "taken_at": format_taken_at(video.taken_at),
+        "taken_at_ts": video.taken_at,
+        "pinned": video.pinned,
+        "downloaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    sidecar = dest.parent / (dest.name + ".json")
+    sidecar.write_text(json.dumps(meta, indent=1, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def download_with_yt_dlp(
@@ -897,7 +1070,6 @@ def consume_video_stream(
                 consecutive_known += 1
             if should_stop_after_existing(
                 consecutive_known,
-                pinned=False,
                 full=args.full,
                 threshold=args.stop_after_existing,
             ):
@@ -934,7 +1106,7 @@ def download_listed(
             return False
         if client is None:
             raise InstagramError("cookies_required", "Native download needs cookies")
-        ok = download_native(client, video, args.out)
+        ok = download_native(client, video, args.out, write_metadata=args.write_metadata)
         if ok:
             skip.remember(video.video_id)
         return ok
@@ -1026,7 +1198,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--request-sleep",
         type=float,
         default=1.5,
-        help="Seconds to wait between Instagram listing requests",
+        help="Seconds to wait between Instagram listing requests (±25%% jitter)",
+    )
+    parser.add_argument(
+        "--ig-app-id",
+        default=os.environ.get("IG_APP_ID", IG_WEB_APP_ID),
+        help="Instagram web app id sent as X-IG-App-ID (env: IG_APP_ID)",
+    )
+    parser.add_argument(
+        "--cursors",
+        type=Path,
+        default=Path("data/cursors.json"),
+        help="JSON file where --full scans save their pagination position",
+    )
+    parser.add_argument(
+        "--write-metadata",
+        action="store_true",
+        help="Write a .json sidecar with metadata next to each downloaded file",
     )
     parser.add_argument(
         "--downloader",
@@ -1046,13 +1234,15 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
     try:
-        yt_dlp = maybe_yt_dlp(args)
         if args.max < 0 or args.retries < 0:
             raise InstagramError("invalid_args", "--max and --retries must be >= 0")
         entries = parse_profile_file(args.profiles)
+        yt_dlp = maybe_yt_dlp(args)
         skip = SkipStore(args.archive, args.out)
         skip.load()
-        client = maybe_client(args, entries)
+        cursors = CursorStore(args.cursors)
+        cursors.load()
+        client = maybe_client(args, entries, cursors if args.full else None)
         stats = RunStats()
         for entry in entries:
             if stats.max_reached(args.max):
@@ -1069,6 +1259,9 @@ def main(argv: list[str] | None = None) -> int:
     except InstagramError as exc:
         LOG.error("%s [%s]", exc, exc.code)
         return 1
+    except KeyboardInterrupt:
+        LOG.warning("Interrupted — progress so far is kept in archive and cursors")
+        return 130
 
 
 def maybe_yt_dlp(args: argparse.Namespace) -> list[str] | None:
@@ -1089,13 +1282,23 @@ def maybe_yt_dlp(args: argparse.Namespace) -> list[str] | None:
     return None
 
 
-def maybe_client(args: argparse.Namespace, entries: list[Entry]) -> InstagramClient | None:
+def maybe_client(
+    args: argparse.Namespace,
+    entries: list[Entry],
+    cursors: CursorStore | None,
+) -> InstagramClient | None:
     needs_client = args.downloader == "native" or any(
         isinstance(entry, Profile) for entry in entries
     )
     if not needs_client:
         return None
-    return InstagramClient(args.cookies, args.request_sleep, retries=args.retries)
+    return InstagramClient(
+        args.cookies,
+        args.request_sleep,
+        retries=args.retries,
+        app_id=args.ig_app_id,
+        cursors=cursors,
+    )
 
 
 if __name__ == "__main__":

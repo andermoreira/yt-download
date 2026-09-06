@@ -25,13 +25,7 @@ O dump **não** acessa o Instagram (o extractor do yt-dlp está quebrado e essa 
 
 ## Uso
 
-Edite `profiles.txt` — um item por linha:
-
-```
-andres.ague
-https://www.instagram.com/outro.perfil/
-https://www.instagram.com/andres.ague/reel/CSIeW8lg-Pd/
-```
+Copie `profiles.txt.example` para `profiles.txt` e edite — um item por linha. `profiles.txt` não vai no git.
 
 ```bash
 python download_instagram.py

@@ -1,0 +1,2 @@
+# Optional. Only needed for --downloader yt-dlp or --cookies-from-browser.
+# yt-dlp>=2025.1.0

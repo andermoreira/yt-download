@@ -283,6 +283,14 @@ class SinkSafetyTests(unittest.TestCase):
             self.assertEqual(part.read_bytes(), b"data")
             self.assertEqual(part.stat().st_mode & 0o777, 0o600)
 
+    def test_open_part_file_truncates_leftover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            part = Path(tmp) / "video.mp4.part"
+            part.write_bytes(b"stale bytes from an interrupted run")
+            with ig.open_part_file(part) as handle:
+                handle.write(b"new")
+            self.assertEqual(part.read_bytes(), b"new")
+
 
 class CursorTests(unittest.TestCase):
     def test_cursor_roundtrip(self) -> None:
@@ -307,6 +315,19 @@ class CursorTests(unittest.TestCase):
             store = ig.CursorStore(path)
             store.load()
             self.assertIsNone(store.get("user:reels"))
+
+    def test_cursor_load_drops_non_string_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cursors.json"
+            path.write_text(
+                json.dumps({"user:reels": None, "user:feed": "", "user:tv": "abc"}),
+                encoding="utf-8",
+            )
+            store = ig.CursorStore(path)
+            store.load()
+            self.assertIsNone(store.get("user:reels"))
+            self.assertIsNone(store.get("user:feed"))
+            self.assertEqual(store.get("user:tv"), "abc")
 
 
 class MetadataTests(unittest.TestCase):
@@ -352,6 +373,19 @@ class ClientTests(unittest.TestCase):
             cookies.write_text("# empty\n", encoding="utf-8")
             with self.assertRaises(ig.InstagramError):
                 ig.InstagramClient(cookies, 0.0)
+
+    def test_download_url_skips_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cookies = root / "cookies.txt"
+            self.make_cookies(cookies)
+            client = ig.InstagramClient(cookies, 0.0)
+            dest = root / "andres.ague" / "reels" / "2021-07-15_CSIeW8lg-Pd.mp4"
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(b"already here")
+            self.assertFalse(
+                client.download_url("https://scontent.cdninstagram.com/v/x.mp4", dest)
+            )
 
 
 class JitterTests(unittest.TestCase):

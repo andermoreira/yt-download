@@ -367,6 +367,14 @@ class ClientTests(unittest.TestCase):
             client = ig.InstagramClient(cookies, 0.0, app_id="123456789")
             self.assertEqual(client._headers()["X-IG-App-ID"], "123456789")
 
+    def test_headers_use_configured_user_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            self.make_cookies(cookies)
+            client = ig.InstagramClient(cookies, 0.0, user_agent="TestUA/1.0")
+            self.assertEqual(client._headers()["User-Agent"], "TestUA/1.0")
+            self.assertIn("Chrome/152", ig.CHROME_UA)
+
     def test_init_rejects_missing_sessionid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cookies = Path(tmp) / "cookies.txt"
@@ -386,6 +394,58 @@ class ClientTests(unittest.TestCase):
             self.assertFalse(
                 client.download_url("https://scontent.cdninstagram.com/v/x.mp4", dest)
             )
+
+
+class CookieExportTests(unittest.TestCase):
+    def test_cookie_export_cmd_does_not_hit_instagram(self) -> None:
+        cmd = ig.cookie_export_cmd(
+            ["yt-dlp"],
+            "chrome",
+            Path("cookies.txt"),
+            "TestUA/1.0",
+        )
+        joined = " ".join(cmd)
+        self.assertNotIn("instagram.com", joined.lower())
+        self.assertIn(ig.COOKIE_DUMP_URL, cmd)
+        self.assertIn("--user-agent", cmd)
+        self.assertIn("TestUA/1.0", cmd)
+        self.assertIn("--cookies-from-browser", cmd)
+
+    def test_jar_has_instagram_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cookies.txt"
+            self.assertFalse(ig.jar_has_instagram_session(path))
+            path.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\tnope\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(ig.jar_has_instagram_session(path))
+            path.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\tabc\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(ig.jar_has_instagram_session(path))
+
+    def test_export_rejects_dump_without_instagram_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "cookies.txt"
+
+            def fake_run(_cmd: list[str], check: bool) -> unittest.mock.Mock:
+                dest.write_text(
+                    "# Netscape HTTP Cookie File\n"
+                    ".youtube.com\tTRUE\t/\tTRUE\t9999999999\tSID\tabc\n",
+                    encoding="utf-8",
+                )
+                result = unittest.mock.Mock()
+                result.returncode = 0
+                return result
+
+            with unittest.mock.patch("download_instagram.subprocess.run", fake_run):
+                with self.assertRaises(ig.InstagramError) as raised:
+                    ig.export_browser_cookies(["yt-dlp"], "chrome", dest)
+            self.assertEqual(raised.exception.code, "cookies_required")
 
 
 class JitterTests(unittest.TestCase):

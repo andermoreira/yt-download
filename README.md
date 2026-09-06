@@ -15,11 +15,13 @@ Não precisa instalar nada além do Python, se você já tiver um `cookies.txt` 
 O Instagram exige sessão logada. Duas formas:
 
 1. Exporte `cookies.txt` (extensão tipo *Get cookies.txt LOCALLY*) e coloque na raiz do projeto.
-2. Ou, se o yt-dlp estiver instalado:
+2. Ou, se o yt-dlp estiver instalado (Chrome fechado; perfil Default = `chrome`, outro = `chrome:Profile 1`):
 
 ```bash
-python download_instagram.py --cookies-from-browser chrome
+python3 download_instagram.py --cookies-from-browser chrome
 ```
+
+O dump **não** acessa o Instagram (o extractor do yt-dlp está quebrado e essa request pode invalidar a sessão). O User-Agent padrão é Chrome 152 — se o browser for outra major, passe `--user-agent` ou `IG_USER_AGENT`.
 
 ## Uso
 
@@ -93,11 +95,11 @@ python download_instagram.py --downloader yt-dlp
 ## Opções úteis
 
 ```bash
-python download_instagram.py --dry-run
-python download_instagram.py --reels-only
-python download_instagram.py --max 20 --retries 5
-python download_instagram.py --full --write-metadata
-python download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
+python3 download_instagram.py --dry-run
+python3 download_instagram.py --reels-only
+python3 download_instagram.py --max 20 --retries 5
+python3 download_instagram.py --full --write-metadata
+python3 download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 ```
 
 `--help` tem a lista completa (em inglês).

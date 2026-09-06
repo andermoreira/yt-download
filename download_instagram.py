@@ -29,11 +29,17 @@ T = TypeVar("T")
 
 IG_WEB_APP_ID = "936619743392459"
 IG_ORIGIN = "https://www.instagram.com"
+# Reduced Chrome UA (major must match the browser that created the cookies).
+# Override with --user-agent / IG_USER_AGENT when the local Chrome moves on.
 CHROME_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+    "Chrome/152.0.0.0 Safari/537.36"
 )
+# yt-dlp's Instagram extractor is broken. Hitting IG_ORIGIN during cookie dump
+# can challenge the session before we list anything; YouTube is only bait so
+# yt-dlp loads the browser jar and writes --cookies.
+COOKIE_DUMP_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{8,15}$")
 STEM_PREFIX_RE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}|undated)_(.+)$")
@@ -411,19 +417,47 @@ def find_yt_dlp() -> list[str]:
     )
 
 
-def export_browser_cookies(yt_dlp: list[str], browser: str, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
+def cookie_export_cmd(
+    yt_dlp: list[str],
+    browser: str,
+    dest: Path,
+    user_agent: str,
+) -> list[str]:
+    return [
         *yt_dlp,
         "--cookies-from-browser",
         browser,
         "--cookies",
         str(dest),
+        "--user-agent",
+        user_agent,
         "--skip-download",
         "--no-warnings",
         "-q",
-        f"{IG_ORIGIN}/",
+        COOKIE_DUMP_URL,
     ]
+
+
+def jar_has_instagram_session(path: Path) -> bool:
+    jar = MozillaCookieJar(str(path))
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except OSError:
+        return False
+    return any(
+        cookie.name == "sessionid" and "instagram.com" in (cookie.domain or "")
+        for cookie in jar
+    )
+
+
+def export_browser_cookies(
+    yt_dlp: list[str],
+    browser: str,
+    dest: Path,
+    user_agent: str = CHROME_UA,
+) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = cookie_export_cmd(yt_dlp, browser, dest, user_agent)
     LOG.info("Exporting cookies from browser %s", browser)
     result = subprocess.run(cmd, check=False)
     if dest.is_file():
@@ -432,6 +466,12 @@ def export_browser_cookies(yt_dlp: list[str], browser: str, dest: Path) -> None:
         raise InstagramError(
             "cookie_export_failed",
             f"Could not export cookies from browser {browser}",
+        )
+    if not dest.is_file() or not jar_has_instagram_session(dest):
+        raise InstagramError(
+            "cookies_required",
+            "Browser dump has no Instagram sessionid. "
+            "Log in on that Chrome profile, close the browser, and retry.",
         )
 
 
@@ -445,6 +485,7 @@ class InstagramClient:
         retries: int = 3,
         *,
         app_id: str = IG_WEB_APP_ID,
+        user_agent: str = CHROME_UA,
         cursors: CursorStore | None = None,
     ) -> None:
         if not cookies_path.is_file():
@@ -456,6 +497,7 @@ class InstagramClient:
         self.request_sleep = request_sleep
         self.retries = retries
         self.app_id = app_id
+        self.user_agent = user_agent
         self.cursors = cursors
         self._www_claim = "0"
         self._requests_made = 0
@@ -514,7 +556,7 @@ class InstagramClient:
     def _headers(self) -> dict[str, str]:
         return {
             "Accept": "*/*",
-            "User-Agent": CHROME_UA,
+            "User-Agent": self.user_agent,
             "X-CSRFToken": self._csrf(),
             "X-IG-App-ID": self.app_id,
             "X-ASBD-ID": "129477",
@@ -584,7 +626,9 @@ class InstagramClient:
         if looks_like_login_page(final_url, body):
             raise InstagramError(
                 "instagram_auth_required",
-                "Instagram redirected to a login/challenge page. Refresh cookies and retry.",
+                "Instagram redirected to a login/challenge page "
+                f"({final_url}). Refresh cookies and retry with a User-Agent "
+                "that matches the browser that exported them.",
             )
         try:
             payload = json.loads(body)
@@ -747,7 +791,7 @@ class InstagramClient:
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": CHROME_UA,
+                "User-Agent": self.user_agent,
                 "Referer": f"{IG_ORIGIN}/",
                 "Accept": "*/*",
             },
@@ -1218,6 +1262,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Instagram web app id sent as X-IG-App-ID (env: IG_APP_ID)",
     )
     parser.add_argument(
+        "--user-agent",
+        default=os.environ.get("IG_USER_AGENT", CHROME_UA),
+        help=(
+            "HTTP User-Agent; must match the browser that created the cookies "
+            "(env: IG_USER_AGENT)"
+        ),
+    )
+    parser.add_argument(
         "--cursors",
         type=Path,
         default=Path("data/cursors.json"),
@@ -1286,7 +1338,12 @@ def maybe_yt_dlp(args: argparse.Namespace) -> list[str] | None:
                 "cookie_export_failed",
                 "Install yt-dlp to use --cookies-from-browser, or pass a Netscape --cookies file",
             ) from exc
-        export_browser_cookies(yt_dlp, args.cookies_from_browser, args.cookies)
+        export_browser_cookies(
+            yt_dlp,
+            args.cookies_from_browser,
+            args.cookies,
+            user_agent=args.user_agent,
+        )
         if args.downloader == "yt-dlp":
             return yt_dlp
         return None
@@ -1310,6 +1367,7 @@ def maybe_client(
         args.request_sleep,
         retries=args.retries,
         app_id=args.ig_app_id,
+        user_agent=args.user_agent,
         cursors=cursors,
     )
 

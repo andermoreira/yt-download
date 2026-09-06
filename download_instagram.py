@@ -64,7 +64,7 @@ RESERVED_PATHS = {
 }
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mkv", ".mov"}
-RETRYABLE_HTTP = frozenset({429, 500, 502, 503})
+RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504})
 CDN_HOST_RE = re.compile(r"^(?:[a-z0-9-]+\.)*(?:cdninstagram\.com|fbcdn\.net)$")
 
 
@@ -94,7 +94,7 @@ class Profile:
     username: str
 
 
-Entry = Union[DirectMedia, Profile]  # noqa: UP007 (runtime alias; keeps py3.9 imports working)
+Entry = Union[DirectMedia, Profile]  # noqa: UP007 (runtime alias; X | Y needs py3.10 at runtime)
 
 
 def is_safe_username(name: str) -> bool:
@@ -351,7 +351,11 @@ class CursorStore:
             LOG.warning("Ignoring corrupt cursor file %s", self.path)
             return
         if isinstance(data, dict):
-            self._data = {str(key): str(value) for key, value in data.items()}
+            self._data = {
+                str(key): value
+                for key, value in data.items()
+                if isinstance(value, str) and value
+            }
 
     def get(self, key: str) -> str | None:
         return self._data.get(key)
@@ -378,8 +382,13 @@ def restrict_permissions(path: Path) -> None:
 
 
 def open_part_file(path: Path) -> BinaryIO:
-    """Create/truncate a .part file without following a pre-planted symlink."""
-    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    """Create/truncate a .part file, refusing a symlink at the final component.
+
+    O_TRUNC keeps a leftover .part from an interrupted run from bleeding its tail
+    into a shorter new download. O_NOFOLLOW only guards the last path component;
+    the parent dirs are program-controlled (validated username / fixed kind).
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
     return os.fdopen(os.open(path, flags, 0o600), "wb")
 
 
@@ -718,18 +727,20 @@ class InstagramClient:
             raise InstagramError("media_not_found", f"No media for {shortcode}")
         return items[0]
 
-    def download_url(self, url: str, dest: Path) -> None:
+    def download_url(self, url: str, dest: Path) -> bool:
+        """Return True when the file was fetched now, False when it was already on disk."""
         if not is_safe_media_url(url):
             raise InstagramError("unsafe_media_url", f"Refusing non-CDN URL for {dest.name}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
-            return
+            return False
         call_with_retry(
             lambda: self._download_url_once(url, dest),
             retries=self.retries,
             request_sleep=self.request_sleep,
             what=dest.name,
         )
+        return True
 
     def _download_url_once(self, url: str, dest: Path) -> None:
         tmp = dest.with_name(dest.name + ".part")
@@ -900,8 +911,9 @@ def download_native(
     LOG.info("Downloading %s", video.url)
     try:
         for url, dest in zip(video.file_urls, native_destinations(download_dir, video), strict=True):
-            client.download_url(url, dest)
-            if write_metadata:
+            fetched = client.download_url(url, dest)
+            sidecar = dest.parent / (dest.name + ".json")
+            if write_metadata and (fetched or not sidecar.exists()):
                 write_metadata_file(dest, video, url)
     except InstagramError as exc:
         if exc.code not in {"download_failed", "instagram_network", "unsafe_media_url"}:
@@ -1240,9 +1252,10 @@ def main(argv: list[str] | None = None) -> int:
         yt_dlp = maybe_yt_dlp(args)
         skip = SkipStore(args.archive, args.out)
         skip.load()
-        cursors = CursorStore(args.cursors)
-        cursors.load()
-        client = maybe_client(args, entries, cursors if args.full else None)
+        cursors = CursorStore(args.cursors) if args.full else None
+        if cursors is not None:
+            cursors.load()
+        client = maybe_client(args, entries, cursors)
         stats = RunStats()
         for entry in entries:
             if stats.max_reached(args.max):

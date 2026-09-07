@@ -1,7 +1,10 @@
 # Copy to profiles.txt (that file is gitignored).
-# One Instagram username, profile URL, or reel/post URL per line.
+# One Instagram reel/post URL, username, or profile URL per line.
 # Lines starting with # are ignored.
+#
+# Reel/post URLs download directly. Usernames and profile URLs are skipped
+# unless you run --discover-only (then download with --from-queue).
 
-andres.ague
-https://www.instagram.com/outro.perfil/
-# https://www.instagram.com/andres.ague/reel/CSIeW8lg-Pd/
+https://www.instagram.com/andres.ague/reel/CSIeW8lg-Pd/
+# andres.ague
+# https://www.instagram.com/outro.perfil/

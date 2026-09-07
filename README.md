@@ -1,14 +1,19 @@
 # yt-down
 
-Baixa vídeos de perfis do Instagram. Na segunda execução, só puxa o que ainda não está no disco nem no `data/archive.txt`.
+Baixa vídeos do Instagram. Na segunda execução, só puxa o que ainda não está no disco nem no `data/archive.txt`.
 
-Por padrão **não usa yt-dlp**: a listagem já traz `video_versions` (MP4 no CDN do Instagram), o mesmo campo que o [gallery-dl](https://github.com/mikf/gallery-dl) usa. O download é HTTP com a biblioteca padrão.
+Há dois passos separados, no mesmo espírito do gallery-dl (extractor vs downloader) e do `yt-dlp --skip-download`:
 
-yt-dlp continua opcional (`--downloader yt-dlp`) e também serve só para exportar cookies do browser.
+1. **Descobrir** — perfil → fila JSONL (`data/queue.jsonl`), sem baixar MP4.
+2. **Baixar** — fila → `media/info` + CDN. URLs de CDN **não** entram na fila (expiram).
+
+Por padrão **não usa yt-dlp**: o download nativo pede o MP4 no CDN. yt-dlp continua opcional (`--downloader yt-dlp`) e também serve só para exportar cookies do browser.
+
+A listagem REST de perfil (`clips/user`, `feed/user`) frequentemente responde **429**. O discover usa GraphQL da web (o mesmo caminho do instaloader) e cai no REST se o GraphQL falhar. URLs diretas de reel/post usam `media/info` e costumam funcionar.
 
 ## Setup
 
-Python 3.10+ (no macOS o `python3` do Xcode pode ser 3.9 — use o do Homebrew).
+Python 3.10+ (no macOS o `python3` do Xcode pode ser 3.9 — use o do Homebrew: `export PATH="/opt/homebrew/bin:$PATH"`).
 
 Não precisa instalar nada além do Python, se você já tiver um `cookies.txt` Netscape.
 
@@ -27,9 +32,32 @@ O dump **não** acessa o Instagram (o extractor do yt-dlp está quebrado e essa 
 
 Copie `profiles.txt.example` para `profiles.txt` e edite — um item por linha. `profiles.txt` não vai no git.
 
+### Reel ou post (sem listar perfil)
+
 ```bash
-python download_instagram.py
+python3 download_instagram.py --profiles profiles.txt --max 1 --request-sleep 2
 ```
+
+Se `profiles.txt` tiver username ou URL de perfil, o script **pula** com warning. Listagem de perfil não roda no caminho padrão (evita 429 longo).
+
+### Descobrir perfil → fila
+
+```bash
+python3 download_instagram.py --discover-only --max 20
+```
+
+Comece com `--max` baixo. `--max` limita **linhas novas** na fila. 429 no meio do caminho deixa o JSONL parcial. `--stop-after-existing` continua valendo. Reel/post em `profiles.txt` entra na fila **sem** chamar `media/info`, mesmo se o ID já estiver no archive — quem pula o MP4 é o `--from-queue`.
+
+Não rode o caminho padrão (`python3 download_instagram.py` sem flags) no `profiles.txt` de usernames: isso **pula** perfil. Use `--discover-only` e depois `--from-queue`.
+
+### Baixar da fila
+
+```bash
+python3 download_instagram.py --from-queue --dry-run --max 1
+python3 download_instagram.py --from-queue --max 5
+```
+
+`--discover-only` e `--from-queue` são mutuamente exclusivos. Fila padrão: `data/queue.jsonl` (`--queue` troca o path).
 
 Arquivos ficam assim:
 
@@ -53,23 +81,15 @@ O script considera um vídeo como já existente se:
 1. o ID está em `data/archive.txt`; ou
 2. já existe um arquivo com esse ID em `downloads/` (`2021-07-15_CSIeW8lg-Pd.mp4` ou o shortcode sozinho).
 
-Em perfil, reels e feed são varridos **separados**. Depois de 3 vídeos seguidos que você já tem **naquela aba**, a varredura da aba para — pinned posts não entram nessa conta. Para varrer tudo:
+Em `--discover-only`, reels e feed são varridos **separados**. Depois de 3 vídeos seguidos que você já tem **naquela aba**, a varredura da aba para — pinned posts não entram nessa conta. Para varrer tudo:
 
 ```bash
-python download_instagram.py --full
+python3 download_instagram.py --discover-only --full
 ```
 
-Na primeira sincronização de um perfil grande, limite o lote:
+`--full` salva a posição da paginação em `data/cursors.json` depois de cada página. Se a varredura for interrompida (Ctrl+C sai com código 130, `--max`, crash), a próxima `--full` do mesmo perfil retoma do ponto salvo. Quando uma aba termina naturalmente, o cursor dela é apagado. Varreduras sem `--full` ignoram cursors; para recomeçar do topo, apague o arquivo.
 
-```bash
-python download_instagram.py --max 20
-```
-
-Ao terminar, o script imprime `downloaded / skipped / failed` e sai com código `1` se algum download falhou. 429 e erros de rede tentam de novo (padrão: 3 retries). Linhas inválidas em `profiles.txt` são puladas com warning — não abortam a execução.
-
-## Resume de varredura profunda
-
-`--full` salva a posição da paginação em `data/cursors.json` depois de cada página consumida. Se a varredura for interrompida (Ctrl+C sai com código 130, `--max`, crash), a próxima `--full` do mesmo perfil retoma do ponto salvo em vez de recomeçar do topo. Quando uma aba termina naturalmente, o cursor dela é apagado. Varreduras sem `--full` ignoram cursors; para recomeçar do topo, apague o arquivo.
+Ao terminar, o script imprime `downloaded / skipped / failed` (e `listed` quando enfileirou ou fez dry-run) e sai com código `1` se algum download falhou. 429 e erros de rede tentam de novo (padrão: 3 retries). Linhas inválidas em `profiles.txt` ou na fila são puladas com warning — não abortam a execução.
 
 ## Metadados
 
@@ -77,11 +97,11 @@ Ao terminar, o script imprime `downloaded / skipped / failed` e sai com código 
 
 ## yt-dlp (opcional)
 
-O extractor de perfil do yt-dlp (`instagram:user`) está marcado como quebrado. Mesmo no modo yt-dlp, a listagem continua pela API web; o yt-dlp só baixa cada reel.
+O extractor de perfil do yt-dlp (`instagram:user`) está marcado como quebrado. Mesmo no modo yt-dlp, a listagem de perfil (quando você usa `--discover-only`) continua pela API web; o yt-dlp só baixa cada reel.
 
 ```bash
 pip install -U yt-dlp
-python download_instagram.py --downloader yt-dlp
+python3 download_instagram.py --from-queue --downloader yt-dlp
 ```
 
 Útil se o CDN não mandar `video_versions` (casos em que o gallery-dl cai no manifesto DASH).
@@ -89,10 +109,10 @@ python download_instagram.py --downloader yt-dlp
 ## Opções úteis
 
 ```bash
-python3 download_instagram.py --dry-run
-python3 download_instagram.py --reels-only
-python3 download_instagram.py --max 20 --retries 5
-python3 download_instagram.py --full --write-metadata
+python3 download_instagram.py --dry-run --profiles um-reel.txt
+python3 download_instagram.py --discover-only --reels-only --max 20
+python3 download_instagram.py --from-queue --max 20 --retries 5
+python3 download_instagram.py --from-queue --write-metadata
 python3 download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 ```
 
@@ -103,4 +123,5 @@ python3 download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 - Cookies de conta logada em automação podem levar a bloqueio. Prefira uma sessão que você aceite perder.
 - Não commite `cookies.txt`. O script aplica chmod 600 nele (export do browser e leitura).
 - O app-id do Instagram muda de vez em quando. Se os endpoints começarem a falhar em massa, atualize com `--ig-app-id` ou a env `IG_APP_ID`.
-- Se o Instagram responder login/rate-limit, atualize os cookies e aumente `--request-sleep` (que já vai com ±25% de jitter).
+- Se o Instagram responder login/rate-limit, atualize os cookies e aumente `--request-sleep` (que já vai com ±25% de jitter; o padrão é 6s). O download usa GraphQL quando o REST `media/info` estiver em 429.
+- `--discover-only` em `profiles.txt` de usernames usa GraphQL para listar. Se o Meta rotacionar os `doc_id`, a listagem pode quebrar até atualizar o script.

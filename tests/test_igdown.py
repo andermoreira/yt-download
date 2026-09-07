@@ -1,8 +1,10 @@
+import gzip
 import json
 import os
 import tempfile
 import unittest
 import unittest.mock
+import urllib.request
 from pathlib import Path
 
 import download_instagram as ig
@@ -25,6 +27,62 @@ class ParseTests(unittest.TestCase):
         )
         self.assertIsNone(ig.parse_line("# comment"))
         self.assertIsNone(ig.parse_line("  "))
+
+    def test_looks_like_login_page(self) -> None:
+        html = "<!doctype html><html>"
+        api = "https://www.instagram.com/api/v1/users/web_profile_info/"
+        home = "https://www.instagram.com/"
+        self.assertTrue(
+            ig.looks_like_login_page(
+                "https://www.instagram.com/accounts/login/",
+                html,
+                request_url=api,
+            )
+        )
+        self.assertTrue(
+            ig.looks_like_login_page(
+                "https://www.instagram.com/challenge/",
+                html,
+                request_url=api,
+            )
+        )
+        self.assertFalse(ig.looks_like_login_page(home, html, request_url=api))
+        self.assertFalse(
+            ig.looks_like_login_page(
+                home,
+                '<html lang="en" class="no-js logged-in ">',
+                request_url=api,
+            )
+        )
+        self.assertFalse(ig.looks_like_login_page(home, html, request_url=home))
+        self.assertFalse(ig.looks_like_login_page(api, html, request_url=api))
+        self.assertFalse(ig.looks_like_login_page(api, '{"ok":true}', request_url=api))
+
+    def test_decode_gzip_body(self) -> None:
+        payload = b'{"status":"ok"}'
+        compressed = gzip.compress(payload)
+        self.assertEqual(ig.decode_http_body(compressed, "gzip"), payload)
+        self.assertEqual(ig.decode_http_body(compressed, None), payload)
+        self.assertEqual(ig.decode_http_body(payload, None), payload)
+
+    def test_redirect_handler_blocks_home_bounce(self) -> None:
+        handler = ig.InstagramRedirectHandler()
+        req = urllib.request.Request("https://www.instagram.com/api/v1/clips/user/")
+        self.assertIsNone(
+            handler.redirect_request(
+                req, None, 302, "Found", {}, "https://www.instagram.com/"
+            )
+        )
+        self.assertIsNone(
+            handler.redirect_request(
+                req, None, 302, "Found", {}, "https://www.instagram.com/accounts/login/"
+            )
+        )
+
+    def test_chrome_client_hint_headers(self) -> None:
+        hints = ig.chrome_client_hint_headers(ig.CHROME_UA)
+        self.assertIn("152", hints["Sec-CH-UA"])
+        self.assertEqual(ig.chrome_client_hint_headers("TestUA/1.0"), {})
 
     def test_parse_profile_file_skips_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,6 +184,54 @@ class MediaTests(unittest.TestCase):
         )
         self.assertEqual(urls, ("https://cdn.example/a.mp4",))
 
+    def test_graphql_connection_media_clips_and_feed(self) -> None:
+        clips = {
+            "data": {
+                ig.GQL_CLIPS_CONNECTION: {
+                    "edges": [
+                        {
+                            "node": {
+                                "media": {
+                                    "code": "Dc1JqMHgkm1",
+                                    "media_type": 2,
+                                    "product_type": "clips",
+                                }
+                            }
+                        }
+                    ],
+                    "page_info": {"has_next_page": True, "end_cursor": "abc"},
+                }
+            }
+        }
+        items, info = ig.graphql_connection_media(clips, ig.GQL_CLIPS_CONNECTION)
+        self.assertEqual(items[0]["code"], "Dc1JqMHgkm1")
+        self.assertEqual(info["end_cursor"], "abc")
+        video = ig.listed_video_from_media(items[0], "andres.ague", kind="reels")
+        self.assertIsNotNone(video)
+        assert video is not None
+        self.assertEqual(video.video_id, "Dc1JqMHgkm1")
+        self.assertEqual(video.file_urls, ())
+        feed = {
+            "data": {
+                ig.GQL_FEED_CONNECTION: {
+                    "edges": [
+                        {
+                            "node": {
+                                "code": "CSIeW8lg-Pd",
+                                "media_type": 2,
+                                "product_type": "clips",
+                                "taken_at": 1628092800,
+                            }
+                        }
+                    ],
+                    "page_info": {"has_next_page": False, "end_cursor": None},
+                }
+            }
+        }
+        feed_items, feed_info = ig.graphql_connection_media(feed, ig.GQL_FEED_CONNECTION)
+        self.assertEqual(feed_items[0]["taken_at"], 1628092800)
+        self.assertFalse(feed_info.get("has_next_page"))
+
     def test_shortcode_to_pk(self) -> None:
         self.assertEqual(ig.shortcode_to_pk("A"), "0")
         self.assertEqual(ig.shortcode_to_pk("B"), "1")
@@ -213,6 +319,9 @@ class StatsTests(unittest.TestCase):
         self.assertTrue(stats.max_reached(2))
         stats.record("failed")
         self.assertEqual(stats.exit_code(), 1)
+        listed = ig.RunStats()
+        listed.record("listed")
+        self.assertTrue(listed.max_reached(1))
 
 
 class SinkSafetyTests(unittest.TestCase):
@@ -374,6 +483,18 @@ class ClientTests(unittest.TestCase):
             client = ig.InstagramClient(cookies, 0.0, user_agent="TestUA/1.0")
             self.assertEqual(client._headers()["User-Agent"], "TestUA/1.0")
             self.assertIn("Chrome/152", ig.CHROME_UA)
+            self.assertNotIn("Sec-CH-UA", client._headers())
+
+    def test_headers_include_chrome_client_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            self.make_cookies(cookies)
+            client = ig.InstagramClient(cookies, 0.0)
+            headers = client._headers()
+            self.assertIn("152", headers["Sec-CH-UA"])
+            self.assertEqual(headers["X-ASBD-ID"], "359341")
+            self.assertEqual(headers["Sec-CH-UA-Mobile"], "?0")
+            self.assertEqual(headers["Sec-CH-UA-Platform"], '"macOS"')
 
     def test_init_rejects_missing_sessionid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -454,6 +575,228 @@ class JitterTests(unittest.TestCase):
             value = ig.jittered(2.0)
             self.assertGreaterEqual(value, 1.5)
             self.assertLessEqual(value, 2.5)
+
+
+class QueueTests(unittest.TestCase):
+    SAMPLE_URL = "https://www.instagram.com/andres.ague/reel/CSIeW8lg-Pd/"
+
+    def sample_video(self, video_id: str = "CSIeW8lg-Pd") -> ig.ListedVideo:
+        return ig.ListedVideo(
+            video_id=video_id,
+            url=f"https://www.instagram.com/andres.ague/reel/{video_id}/",
+            username="andres.ague",
+            kind="reels",
+            taken_at=1628092800,
+            pinned=False,
+            file_urls=("https://scontent.cdninstagram.com/v/expire.mp4",),
+        )
+
+    def test_queue_roundtrip_skips_cdn_urls_and_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "queue.jsonl"
+            store = ig.QueueStore(path)
+            store.load()
+            video = self.sample_video()
+            self.assertTrue(store.append(video))
+            self.assertFalse(store.append(video))
+            record = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(record["id"], "CSIeW8lg-Pd")
+            self.assertNotIn("file_urls", record)
+            again = ig.QueueStore(path)
+            again.load()
+            self.assertTrue(again.known("CSIeW8lg-Pd"))
+            loaded = ig.load_queue_file(path)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].file_urls, ())
+            self.assertEqual(loaded[0].username, "andres.ague")
+
+    def test_parse_queue_bare_url_and_json(self) -> None:
+        from_url = ig.parse_queue_line(self.SAMPLE_URL)
+        self.assertIsNotNone(from_url)
+        assert from_url is not None
+        self.assertEqual(from_url.video_id, "CSIeW8lg-Pd")
+        self.assertEqual(from_url.username, "andres.ague")
+        self.assertEqual(from_url.kind, "reels")
+        line = json.dumps(
+            {
+                "id": "CSIeW8lg-Pd",
+                "url": self.SAMPLE_URL,
+                "username": "andres.ague",
+                "kind": "reels",
+                "taken_at": 1628092800,
+                "pinned": False,
+            }
+        )
+        parsed = ig.parse_queue_line(line)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.taken_at, 1628092800)
+        self.assertIsNone(ig.parse_queue_line("# comment"))
+        self.assertIsNone(ig.parse_queue_line("not-a-media-url"))
+
+    def test_username_from_media_url(self) -> None:
+        self.assertEqual(ig.username_from_media_url(self.SAMPLE_URL), "andres.ague")
+        self.assertEqual(
+            ig.username_from_media_url("https://www.instagram.com/reel/CSIeW8lg-Pd/"),
+            "instagram",
+        )
+
+    def test_refresh_queued_without_client_keeps_record(self) -> None:
+        queued = self.sample_video()
+        self.assertEqual(ig.refresh_queued_video(queued, None), queued)
+
+    def test_mutually_exclusive_discover_and_from_queue(self) -> None:
+        self.assertEqual(ig.main(["--discover-only", "--from-queue"]), 1)
+
+    def test_main_skips_profile_without_listing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "profiles.txt"
+            profiles.write_text("andres.ague\n", encoding="utf-8")
+            with unittest.mock.patch.object(
+                ig, "InstagramClient", side_effect=AssertionError("must not list profiles")
+            ):
+                code = ig.main(
+                    [
+                        "--profiles",
+                        str(profiles),
+                        "--out",
+                        str(root / "downloads"),
+                        "--archive",
+                        str(root / "archive.txt"),
+                        "--cookies",
+                        str(root / "missing-cookies.txt"),
+                    ]
+                )
+            self.assertEqual(code, 0)
+
+    def test_discover_only_enqueues_direct_media_up_to_max(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "profiles.txt"
+            profiles.write_text(
+                "https://www.instagram.com/andres.ague/reel/CSIeW8lg-Pd/\n"
+                "https://www.instagram.com/andres.ague/reel/CSIeW8lgXXX/\n",
+                encoding="utf-8",
+            )
+            queue = root / "queue.jsonl"
+            with unittest.mock.patch.object(
+                ig, "InstagramClient", side_effect=AssertionError("must not list profiles")
+            ):
+                code = ig.main(
+                    [
+                        "--discover-only",
+                        "--max",
+                        "1",
+                        "--profiles",
+                        str(profiles),
+                        "--queue",
+                        str(queue),
+                        "--out",
+                        str(root / "downloads"),
+                        "--archive",
+                        str(root / "archive.txt"),
+                        "--cookies",
+                        str(root / "missing-cookies.txt"),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            rows = [json.loads(line) for line in queue.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["id"], "CSIeW8lg-Pd")
+
+    def test_discover_only_enqueues_direct_media_already_in_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "profiles.txt"
+            profiles.write_text(self.SAMPLE_URL + "\n", encoding="utf-8")
+            queue = root / "queue.jsonl"
+            archive = root / "archive.txt"
+            archive.write_text("instagram CSIeW8lg-Pd\n", encoding="utf-8")
+            with unittest.mock.patch.object(
+                ig, "InstagramClient", side_effect=AssertionError("must not list profiles")
+            ):
+                code = ig.main(
+                    [
+                        "--discover-only",
+                        "--profiles",
+                        str(profiles),
+                        "--queue",
+                        str(queue),
+                        "--out",
+                        str(root / "downloads"),
+                        "--archive",
+                        str(archive),
+                        "--cookies",
+                        str(root / "missing-cookies.txt"),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(queue.is_file())
+            rows = [json.loads(line) for line in queue.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(rows[0]["id"], "CSIeW8lg-Pd")
+
+    def test_from_queue_dry_run_skips_archived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue = root / "queue.jsonl"
+            queue.write_text(self.SAMPLE_URL + "\n", encoding="utf-8")
+            archive = root / "archive.txt"
+            archive.write_text("instagram CSIeW8lg-Pd\n", encoding="utf-8")
+            with unittest.mock.patch.object(
+                ig, "InstagramClient", side_effect=AssertionError("must not refresh skipped")
+            ):
+                code = ig.main(
+                    [
+                        "--from-queue",
+                        "--dry-run",
+                        "--queue",
+                        str(queue),
+                        "--out",
+                        str(root / "downloads"),
+                        "--archive",
+                        str(archive),
+                        "--failed",
+                        str(root / "failed.txt"),
+                        "--cookies",
+                        str(root / "missing-cookies.txt"),
+                    ]
+                )
+            self.assertEqual(code, 0)
+
+    def test_media_by_shortcode_falls_back_to_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            cookies.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\tabc\n",
+                encoding="utf-8",
+            )
+            client = ig.InstagramClient(cookies, 0.0, retries=0)
+
+            def gql_fail(_shortcode: str) -> dict:
+                raise ig.InstagramError("instagram_api", "GraphQL media errors")
+
+            rest_item = {
+                "code": "Czdv17nrnpR",
+                "media_type": 2,
+                "video_versions": [
+                    {
+                        "url": "https://scontent.cdninstagram.com/v/t50/x.mp4",
+                        "width": 720,
+                        "height": 1280,
+                        "type": 101,
+                    }
+                ],
+            }
+
+            with unittest.mock.patch.object(client, "_media_by_shortcode_graphql", gql_fail):
+                with unittest.mock.patch.object(
+                    client, "_media_by_shortcode_rest", return_value=rest_item
+                ):
+                    media = client.media_by_shortcode("Czdv17nrnpR")
+            self.assertEqual(media["code"], "Czdv17nrnpR")
+            self.assertTrue(ig.video_urls_from_media(media))
 
 
 if __name__ == "__main__":

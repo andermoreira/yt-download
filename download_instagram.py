@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import logging
 import os
@@ -28,7 +29,18 @@ LOG = logging.getLogger("igdown")
 T = TypeVar("T")
 
 IG_WEB_APP_ID = "936619743392459"
+# yt-dlp InstagramBaseIE._api_headers (2026.08.19); gallery-dl still sends 129477.
+IG_ASBD_ID = "359341"
 IG_ORIGIN = "https://www.instagram.com"
+# Instagram web GraphQL (instaloader 2026). REST clips/user and feed/user 429; these
+# still listed. Meta rotates doc_ids — REST remains the fallback.
+GQL_CLIPS_DOC_ID = "27234427476213202"
+GQL_CLIPS_CONNECTION = "xdt_api__v1__clips__user__connection_v2"
+GQL_FEED_DOC_ID = "34579740524958711"
+GQL_FEED_CONNECTION = "xdt_api__v1__feed__user_timeline_graphql_connection"
+# PolarisPostRootQuery (instaloader 2026) — CDN URLs when REST /media/{pk}/info/ 429s.
+GQL_MEDIA_DOC_ID = "27128499623469141"
+GQL_MEDIA_CONNECTION = "xdt_api__v1__media__shortcode__web_info"
 # Reduced Chrome UA (major must match the browser that created the cookies).
 # Override with --user-agent / IG_USER_AGENT when the local Chrome moves on.
 CHROME_UA = (
@@ -40,6 +52,7 @@ CHROME_UA = (
 # can challenge the session before we list anything; YouTube is only bait so
 # yt-dlp loads the browser jar and writes --cookies.
 COOKIE_DUMP_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+CHROME_UA_RE = re.compile(r"Chrome/(\d+)")
 SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{8,15}$")
 STEM_PREFIX_RE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}|undated)_(.+)$")
@@ -119,14 +132,104 @@ def jittered(seconds: float) -> float:
     return seconds * random.uniform(0.75, 1.25)
 
 
-def looks_like_login_page(final_url: str, body: str) -> bool:
-    """gallery-dl aborts on /accounts/login and /challenge redirects; so do we."""
-    head = body[:200].lstrip().lower()
-    return (
-        "/accounts/login" in final_url
-        or "/challenge" in final_url
-        or head.startswith(("<!doctype", "<html"))
-    )
+def is_instagram_home(url: str) -> bool:
+    """True for https://www.instagram.com/ with no extra path (gallery-dl 'home')."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"www.instagram.com", "instagram.com"}:
+        return False
+    return (parsed.path or "/") in {"", "/"}
+
+
+def is_logged_in_html(body: str) -> bool:
+    """Instagram's rate-limit/WAF HTML still includes class=\"logged-in\" when sessionid is valid."""
+    return "logged-in" in body[:4000].lower()
+
+
+def decode_http_body(raw: bytes, content_encoding: str | None) -> bytes:
+    """urllib does not decode Content-Encoding; Instagram often gzips HTML error pages."""
+    encoding = (content_encoding or "").lower()
+    if "gzip" in encoding or raw[:2] == b"\x1f\x8b":
+        try:
+            return gzip.decompress(raw)
+        except OSError:
+            return raw
+    return raw
+
+
+def read_decoded_response(resp: object) -> tuple[str, str]:
+    """Return (text, final_url) from an urllib response or HTTPError."""
+    raw = resp.read()  # type: ignore[attr-defined]
+    headers = getattr(resp, "headers", None)
+    encoding = headers.get("Content-Encoding") if headers else None
+    text = decode_http_body(raw, encoding).decode("utf-8", errors="replace")
+    final_url = resp.geturl() if hasattr(resp, "geturl") else ""
+    return text, final_url
+
+
+class InstagramRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Do not follow bounces to login/home — urllib would turn POST /clips/user/ into GET /."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        path = urllib.parse.urlparse(newurl).path.lower()
+        if path.startswith("/accounts/login") or path.startswith("/challenge") or is_instagram_home(
+            newurl
+        ):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def looks_like_login_page(final_url: str, body: str = "", *, request_url: str = "") -> bool:
+    """True only for login/challenge URLs. Home bounces are rate-limit, not a dead session."""
+    del body, request_url
+    path = urllib.parse.urlparse(final_url).path.lower()
+    return "/accounts/login" in path or "/challenge" in path
+
+
+def raise_for_instagram_http(exc: urllib.error.HTTPError, *, request_url: str) -> None:
+    retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+    location = exc.headers.get("Location") if exc.headers else None
+    dest = urllib.parse.urljoin(request_url, location or "")
+    if exc.code in {401, 403}:
+        raise InstagramError(
+            "instagram_auth_required",
+            "Instagram asked for login. Refresh cookies and retry.",
+            http_status=exc.code,
+        ) from exc
+    if exc.code in {301, 302, 303, 307, 308}:
+        if looks_like_login_page(dest):
+            raise InstagramError(
+                "instagram_auth_required",
+                f"Instagram redirected to a login/challenge page ({dest}).",
+                http_status=exc.code,
+            ) from exc
+        if is_instagram_home(dest):
+            raise InstagramError(
+                "instagram_http",
+                "Instagram redirected to home (rate-limit)",
+                http_status=429,
+                retry_after=retry_after,
+            ) from exc
+    raise InstagramError(
+        "instagram_http",
+        f"Instagram HTTP {exc.code}",
+        http_status=exc.code,
+        retry_after=retry_after,
+    ) from exc
+
+
+def chrome_client_hint_headers(user_agent: str) -> dict[str, str]:
+    match = CHROME_UA_RE.search(user_agent)
+    if not match:
+        return {}
+    major = match.group(1)
+    return {
+        "Sec-CH-UA": (
+            f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not.A/Brand";v="99"'
+        ),
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"macOS"',
+    }
 
 
 @dataclass(frozen=True)
@@ -158,7 +261,7 @@ class RunStats:
             self.listed += 1
 
     def max_reached(self, limit: int) -> bool:
-        return limit > 0 and self.downloaded >= limit
+        return limit > 0 and (self.downloaded + self.listed) >= limit
 
     def log_summary(self) -> None:
         LOG.info(
@@ -168,7 +271,7 @@ class RunStats:
             self.failed,
         )
         if self.listed:
-            LOG.info("Dry-run listed=%s", self.listed)
+            LOG.info("listed=%s", self.listed)
 
     def exit_code(self) -> int:
         return 1 if self.failed else 0
@@ -341,6 +444,35 @@ class SkipStore:
                 self.remember(video_id)
 
 
+class FailStore:
+    """Shortcodes that failed download; skipped on later --from-queue runs until the file is cleared."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._ids: set[str] = set()
+
+    def load(self) -> None:
+        if not self.path.is_file():
+            return
+        for raw in self.path.read_text(encoding="utf-8").splitlines():
+            parts = raw.split()
+            if len(parts) >= 2 and parts[0].lower() == "instagram":
+                self._ids.add(parts[1])
+            elif SHORTCODE_RE.fullmatch(raw.strip()):
+                self._ids.add(raw.strip())
+
+    def known(self, video_id: str) -> bool:
+        return video_id in self._ids
+
+    def remember(self, video_id: str) -> None:
+        if not SHORTCODE_RE.fullmatch(video_id) or video_id in self._ids:
+            return
+        self._ids.add(video_id)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(f"instagram {video_id}\n")
+
+
 class CursorStore:
     """Persists pagination cursors so interrupted --full scans resume where they stopped."""
 
@@ -378,6 +510,133 @@ class CursorStore:
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(self._data, indent=1, sort_keys=True) + "\n", encoding="utf-8")
         tmp.replace(self.path)
+
+
+class QueueStore:
+    """JSONL queue of discovered videos. CDN URLs are not stored; they expire."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._ids: set[str] = set()
+
+    def load(self) -> None:
+        if not self.path.is_file():
+            return
+        for raw in self.path.read_text(encoding="utf-8").splitlines():
+            video = parse_queue_line(raw)
+            if video is not None:
+                self._ids.add(video.video_id)
+
+    def known(self, video_id: str) -> bool:
+        return video_id in self._ids
+
+    def append(self, video: ListedVideo) -> bool:
+        if not SHORTCODE_RE.fullmatch(video.video_id) or video.video_id in self._ids:
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(queue_record(video), sort_keys=True) + "\n")
+        self._ids.add(video.video_id)
+        return True
+
+
+def queue_record(video: ListedVideo) -> dict[str, object]:
+    return {
+        "id": video.video_id,
+        "kind": video.kind,
+        "pinned": video.pinned,
+        "taken_at": video.taken_at,
+        "url": video.url,
+        "username": video.username,
+    }
+
+
+def parse_queue_line(raw: str) -> ListedVideo | None:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        try:
+            entry = parse_line(line)
+        except InstagramError:
+            return None
+        if isinstance(entry, DirectMedia) and entry.video_id:
+            return listed_from_media_url(entry)
+        return None
+    if not isinstance(data, dict):
+        return None
+    video_id = str(data.get("id") or "")
+    if not SHORTCODE_RE.fullmatch(video_id):
+        return None
+    username = str(data.get("username") or "instagram")
+    if not is_safe_username(username):
+        return None
+    url = str(data.get("url") or f"{IG_ORIGIN}/{username}/reel/{video_id}/")
+    kind = str(data.get("kind") or "")
+    if kind not in {"reels", "feed"}:
+        kind = kind_from_url(url)
+    taken_at = data.get("taken_at")
+    taken = None
+    if taken_at is not None:
+        try:
+            taken = int(taken_at)
+        except (TypeError, ValueError):
+            taken = None
+    return ListedVideo(
+        video_id=video_id,
+        url=url.split()[0],
+        username=username,
+        kind=kind,
+        taken_at=taken if taken and taken > 0 else None,
+        pinned=bool(data.get("pinned")),
+        file_urls=(),
+    )
+
+
+def load_queue_file(path: Path) -> list[ListedVideo]:
+    if not path.is_file():
+        raise InstagramError("queue_not_found", f"Queue file not found: {path}")
+    videos: list[ListedVideo] = []
+    seen: set[str] = set()
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        video = parse_queue_line(raw)
+        if video is None:
+            if raw.strip() and not raw.strip().startswith("#"):
+                LOG.warning("Skipping queue line %s", lineno)
+            continue
+        if video.video_id in seen:
+            continue
+        seen.add(video.video_id)
+        videos.append(video)
+    if not videos:
+        raise InstagramError("empty_queue", f"No valid videos in {path}")
+    return videos
+
+
+def listed_from_media_url(entry: DirectMedia) -> ListedVideo | None:
+    if not entry.video_id:
+        return None
+    return ListedVideo(
+        video_id=entry.video_id,
+        url=entry.url.split()[0],
+        username=username_from_media_url(entry.url),
+        kind=kind_from_url(entry.url),
+        taken_at=None,
+        pinned=False,
+        file_urls=(),
+    )
+
+
+def username_from_media_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 3 and parts[1].lower() in {"p", "tv", "reel", "reels"}:
+        name = parts[0]
+        if is_safe_username(name) and name.lower() not in RESERVED_PATHS:
+            return name
+    return "instagram"
 
 
 def restrict_permissions(path: Path) -> None:
@@ -501,6 +760,7 @@ class InstagramClient:
         self.cursors = cursors
         self._www_claim = "0"
         self._requests_made = 0
+        self._bootstrapped = False
         self._user_ids: dict[str, str] = {}
         self._jar = MozillaCookieJar(str(cookies_path))
         try:
@@ -515,9 +775,32 @@ class InstagramClient:
                 "cookies_required",
                 "cookies.txt has no Instagram sessionid. Log in on the browser and export again.",
             )
+        # yt-dlp InstagramPlaylistBaseIE sets this before GraphQL pagination.
+        self._jar.set_cookie(
+            Cookie(
+                version=0,
+                name="ig_pr",
+                value="1",
+                port=None,
+                port_specified=False,
+                domain=".instagram.com",
+                domain_specified=True,
+                domain_initial_dot=True,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+        )
         restrict_permissions(cookies_path)
         self._ensure_csrf()
         self._opener = urllib.request.build_opener(
+            InstagramRedirectHandler(),
             urllib.request.HTTPCookieProcessor(self._jar),
         )
 
@@ -554,12 +837,13 @@ class InstagramClient:
         return ""
 
     def _headers(self) -> dict[str, str]:
-        return {
+        headers = {
             "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
             "User-Agent": self.user_agent,
             "X-CSRFToken": self._csrf(),
             "X-IG-App-ID": self.app_id,
-            "X-ASBD-ID": "129477",
+            "X-ASBD-ID": IG_ASBD_ID,
             "X-IG-WWW-Claim": self._www_claim,
             "X-Requested-With": "XMLHttpRequest",
             "Origin": IG_ORIGIN,
@@ -568,6 +852,33 @@ class InstagramClient:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
+        headers.update(chrome_client_hint_headers(self.user_agent))
+        return headers
+
+    def _bootstrap_session(self) -> None:
+        """GET / so Instagram can set x-ig-set-www-claim before API calls."""
+        if self._bootstrapped:
+            return
+        self._bootstrapped = True
+        home = f"{IG_ORIGIN}/"
+        req = urllib.request.Request(home, headers=self._headers())
+        try:
+            with self._opener.open(req, timeout=30) as resp:
+                claim = resp.headers.get("x-ig-set-www-claim")
+                if claim:
+                    self._www_claim = claim
+                body, final_url = read_decoded_response(resp)
+        except urllib.error.HTTPError as exc:
+            raise_for_instagram_http(exc, request_url=home)
+        except urllib.error.URLError as exc:
+            raise InstagramError("instagram_network", f"Network error: {exc.reason}") from exc
+        self._requests_made += 1
+        if looks_like_login_page(final_url, body, request_url=home):
+            raise InstagramError(
+                "instagram_auth_required",
+                "Instagram redirected to a login/challenge page "
+                f"({final_url}). Log in on the browser, close it, and export cookies again.",
+            )
 
     def _request(
         self,
@@ -595,6 +906,7 @@ class InstagramClient:
         if params:
             request_url = f"{url}?{urllib.parse.urlencode(params)}"
         data = urllib.parse.urlencode(form).encode() if form is not None else None
+        self._bootstrap_session()
         if self.request_sleep > 0 and self._requests_made:
             time.sleep(jittered(self.request_sleep))
         self._requests_made += 1
@@ -604,35 +916,30 @@ class InstagramClient:
                 claim = resp.headers.get("x-ig-set-www-claim")
                 if claim:
                     self._www_claim = claim
-                body = resp.read().decode("utf-8", errors="replace")
-                final_url = resp.geturl()
+                body, final_url = read_decoded_response(resp)
         except urllib.error.HTTPError as exc:
-            retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
-            if exc.code in {401, 403}:
-                raise InstagramError(
-                    "instagram_auth_required",
-                    "Instagram asked for login. Refresh cookies and retry.",
-                    http_status=exc.code,
-                ) from exc
-            raise InstagramError(
-                "instagram_http",
-                f"Instagram HTTP {exc.code}",
-                http_status=exc.code,
-                retry_after=retry_after,
-            ) from exc
+            raise_for_instagram_http(exc, request_url=request_url)
         except urllib.error.URLError as exc:
             raise InstagramError("instagram_network", f"Network error: {exc.reason}") from exc
 
-        if looks_like_login_page(final_url, body):
+        if looks_like_login_page(final_url, body, request_url=request_url):
             raise InstagramError(
                 "instagram_auth_required",
                 "Instagram redirected to a login/challenge page "
-                f"({final_url}). Refresh cookies and retry with a User-Agent "
-                "that matches the browser that exported them.",
+                f"({final_url}) from {request_url}. Refresh cookies and retry "
+                "with a User-Agent that matches the browser that exported them.",
             )
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
+            if is_logged_in_html(body) or (
+                is_instagram_home(final_url) and not is_instagram_home(request_url)
+            ):
+                raise InstagramError(
+                    "instagram_http",
+                    "Instagram returned HTML instead of JSON (rate-limit)",
+                    http_status=429,
+                ) from exc
             raise InstagramError("instagram_api", "Instagram returned a non-JSON response") from exc
         if isinstance(payload, dict) and payload.get("status") == "fail":
             message = str(payload.get("message") or "request failed")
@@ -698,12 +1005,83 @@ class InstagramClient:
         raise InstagramError("user_not_found", f"Could not resolve user id for {username}")
 
     def iter_reels(self, username: str) -> Iterator[ListedVideo]:
-        yield from self._iter_clips(self.user_id(username), username)
+        user_id = self.user_id(username)
+        yield from self._iter_graphql_then_rest(
+            what=f"@{username} reels",
+            graphql=lambda: self._iter_clips_graphql(user_id, username),
+            rest=lambda: self._iter_clips_rest(user_id, username),
+        )
 
     def iter_feed_videos(self, username: str) -> Iterator[ListedVideo]:
-        yield from self._iter_feed_videos(self.user_id(username), username)
+        user_id = self.user_id(username)
+        yield from self._iter_graphql_then_rest(
+            what=f"@{username} feed",
+            graphql=lambda: self._iter_feed_graphql(username),
+            rest=lambda: self._iter_feed_rest(user_id, username),
+        )
 
-    def _apply_cursor(self, key: str, target: dict[str, str]) -> None:
+    def _iter_graphql_then_rest(
+        self,
+        *,
+        what: str,
+        graphql: Callable[[], Iterator[ListedVideo]],
+        rest: Callable[[], Iterator[ListedVideo]],
+    ) -> Iterator[ListedVideo]:
+        yielded = False
+        try:
+            for video in graphql():
+                yielded = True
+                yield video
+        except InstagramError as exc:
+            if yielded:
+                raise
+            LOG.warning("%s GraphQL listing failed [%s]; trying REST", what, exc.code)
+            yield from rest()
+
+    def _graphql_query(self, doc_id: str, variables: dict) -> dict:
+        return self._request(
+            f"{IG_ORIGIN}/graphql/query",
+            form={
+                "doc_id": doc_id,
+                "variables": json.dumps(variables, separators=(",", ":")),
+            },
+        )
+
+    def _paginate_graphql(
+        self,
+        *,
+        username: str,
+        cursor_key: str,
+        kind: str,
+        doc_id: str,
+        connection_key: str,
+        variables: dict,
+    ) -> Iterator[ListedVideo]:
+        data_obj = variables.setdefault("data", {})
+        if not isinstance(data_obj, dict):
+            raise InstagramError("instagram_api", "GraphQL variables.data must be an object")
+        self._apply_cursor(cursor_key, data_obj)
+        while True:
+            payload = self._graphql_query(doc_id, variables)
+            root = payload.get("data")
+            if not isinstance(root, dict) or connection_key not in root:
+                raise InstagramError(
+                    "instagram_api",
+                    f"GraphQL listing missing {connection_key}",
+                )
+            items, page_info = graphql_connection_media(payload, connection_key)
+            for media in items:
+                video = listed_video_from_media(media, username, kind=kind)
+                if video:
+                    yield video
+            more = page_info.get("has_next_page")
+            cursor = page_info.get("end_cursor")
+            self._save_cursor(cursor_key, more, cursor)
+            if not more or not cursor:
+                return
+            data_obj["max_id"] = str(cursor)
+
+    def _apply_cursor(self, key: str, target: dict[str, object]) -> None:
         if self.cursors is None:
             return
         saved = self.cursors.get(key)
@@ -719,7 +1097,23 @@ class InstagramClient:
         else:
             self.cursors.set(key, None)
 
-    def _iter_clips(self, user_id: str, username: str) -> Iterator[ListedVideo]:
+    def _iter_clips_graphql(self, user_id: str, username: str) -> Iterator[ListedVideo]:
+        yield from self._paginate_graphql(
+            username=username,
+            cursor_key=f"{username.lower()}:reels",
+            kind="reels",
+            doc_id=GQL_CLIPS_DOC_ID,
+            connection_key=GQL_CLIPS_CONNECTION,
+            variables={
+                "data": {
+                    "include_feed_video": True,
+                    "page_size": 12,
+                    "target_user_id": str(user_id),
+                }
+            },
+        )
+
+    def _iter_clips_rest(self, user_id: str, username: str) -> Iterator[ListedVideo]:
         key = f"{username.lower()}:reels"
         form = {
             "target_user_id": user_id,
@@ -742,7 +1136,20 @@ class InstagramClient:
                 return
             form["max_id"] = str(max_id)
 
-    def _iter_feed_videos(self, user_id: str, username: str) -> Iterator[ListedVideo]:
+    def _iter_feed_graphql(self, username: str) -> Iterator[ListedVideo]:
+        yield from self._paginate_graphql(
+            username=username,
+            cursor_key=f"{username.lower()}:feed",
+            kind="feed",
+            doc_id=GQL_FEED_DOC_ID,
+            connection_key=GQL_FEED_CONNECTION,
+            variables={
+                "data": {"count": 12, "include_relationship_info": True},
+                "username": username,
+            },
+        )
+
+    def _iter_feed_rest(self, user_id: str, username: str) -> Iterator[ListedVideo]:
         key = f"{username.lower()}:feed"
         params = {"count": "30"}
         self._apply_cursor(key, params)
@@ -764,9 +1171,39 @@ class InstagramClient:
             params["max_id"] = str(max_id)
 
     def media_by_shortcode(self, shortcode: str) -> dict:
+        # Prefer GraphQL: REST /media/{pk}/info/ is frequently 429 after bulk downloads.
+        try:
+            return self._media_by_shortcode_graphql(shortcode)
+        except InstagramError as exc:
+            if exc.code in {"instagram_auth_required", "invalid_entry"}:
+                raise
+            LOG.warning(
+                "GraphQL media failed for %s [%s]; trying REST",
+                shortcode,
+                exc.code,
+            )
+            return self._media_by_shortcode_rest(shortcode)
+
+    def _media_by_shortcode_rest(self, shortcode: str) -> dict:
         pk = shortcode_to_pk(shortcode)
         data = self._request(f"{IG_ORIGIN}/api/v1/media/{pk}/info/")
         items = data.get("items") or []
+        if not items:
+            raise InstagramError("media_not_found", f"No media for {shortcode}")
+        return items[0]
+
+    def _media_by_shortcode_graphql(self, shortcode: str) -> dict:
+        data = self._graphql_query(
+            GQL_MEDIA_DOC_ID,
+            {
+                "shortcode": shortcode,
+                "__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider": False,
+            },
+        )
+        if data.get("errors") and not (data.get("data") or {}).get(GQL_MEDIA_CONNECTION):
+            raise InstagramError("instagram_api", f"GraphQL media errors for {shortcode}")
+        info = (data.get("data") or {}).get(GQL_MEDIA_CONNECTION) or {}
+        items = info.get("items") or []
         if not items:
             raise InstagramError("media_not_found", f"No media for {shortcode}")
         return items[0]
@@ -888,6 +1325,27 @@ def kind_from_media(media: dict, fallback: str) -> str:
     if product in {"feed", "carousel_container", "igtv"}:
         return "feed"
     return fallback
+
+
+def graphql_connection_media(payload: dict, connection_key: str) -> tuple[list[dict], dict]:
+    """Pull media dicts from a GraphQL connection (clips wrap node.media; feed is node)."""
+    root = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(root, dict):
+        return [], {}
+    conn = root.get(connection_key)
+    if not isinstance(conn, dict):
+        return [], {}
+    items: list[dict] = []
+    for edge in conn.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        node = edge.get("node")
+        if not isinstance(node, dict):
+            continue
+        media = node.get("media")
+        items.append(media if isinstance(media, dict) else node)
+    page_info = conn.get("page_info")
+    return items, page_info if isinstance(page_info, dict) else {}
 
 
 def listed_video_from_media(
@@ -1062,52 +1520,58 @@ def listed_from_direct(entry: DirectMedia, client: InstagramClient | None) -> Li
     return listed_video_from_media(media, owner, kind=kind_from_url(entry.url))
 
 
-def process_profile(
+def discover_profile(
     entry: Profile,
     skip: SkipStore,
+    queue: QueueStore,
     client: InstagramClient,
-    yt_dlp: list[str] | None,
     args: argparse.Namespace,
     stats: RunStats,
 ) -> None:
     seen: set[str] = set()
-    LOG.info("Listing reels for @%s", entry.username)
-    consume_video_stream(
-        client.iter_reels(entry.username),
-        label="reels",
-        username=entry.username,
-        seen=seen,
-        skip=skip,
-        client=client,
-        yt_dlp=yt_dlp,
-        args=args,
-        stats=stats,
-    )
+    LOG.info("Discovering reels for @%s", entry.username)
+    try:
+        enqueue_video_stream(
+            client.iter_reels(entry.username),
+            label="reels",
+            username=entry.username,
+            seen=seen,
+            skip=skip,
+            queue=queue,
+            args=args,
+            stats=stats,
+        )
+    except InstagramError as exc:
+        LOG.error("Discover @%s reels failed: %s [%s]", entry.username, exc, exc.code)
+        stats.record("failed")
+        return
     if args.reels_only or stats.max_reached(args.max):
         return
-    LOG.info("Listing feed videos for @%s", entry.username)
-    consume_video_stream(
-        client.iter_feed_videos(entry.username),
-        label="feed",
-        username=entry.username,
-        seen=seen,
-        skip=skip,
-        client=client,
-        yt_dlp=yt_dlp,
-        args=args,
-        stats=stats,
-    )
+    LOG.info("Discovering feed videos for @%s", entry.username)
+    try:
+        enqueue_video_stream(
+            client.iter_feed_videos(entry.username),
+            label="feed",
+            username=entry.username,
+            seen=seen,
+            skip=skip,
+            queue=queue,
+            args=args,
+            stats=stats,
+        )
+    except InstagramError as exc:
+        LOG.error("Discover @%s feed failed: %s [%s]", entry.username, exc, exc.code)
+        stats.record("failed")
 
 
-def consume_video_stream(
+def enqueue_video_stream(
     videos: Iterator[ListedVideo],
     *,
     label: str,
     username: str,
     seen: set[str],
     skip: SkipStore,
-    client: InstagramClient,
-    yt_dlp: list[str] | None,
+    queue: QueueStore,
     args: argparse.Namespace,
     stats: RunStats,
 ) -> None:
@@ -1119,10 +1583,10 @@ def consume_video_stream(
         if video.video_id in seen:
             continue
         seen.add(video.video_id)
-        if skip.known(video.video_id):
+        if skip.known(video.video_id) or queue.known(video.video_id):
             LOG.info("Already have %s", video.video_id)
             stats.record("skipped")
-            if not video.pinned:
+            if skip.known(video.video_id) and not video.pinned:
                 consecutive_known += 1
             if should_stop_after_existing(
                 consecutive_known,
@@ -1138,14 +1602,65 @@ def consume_video_stream(
                 return
             continue
         consecutive_known = 0
-        if args.dry_run:
-            LOG.info("Would download %s", video.url)
+        if queue.append(video):
+            LOG.info("Queued %s", video.url)
             stats.record("listed")
-            continue
-        if download_listed(video, video.url, skip, client, yt_dlp, args):
-            stats.record("downloaded")
-        else:
-            stats.record("failed")
+
+
+def process_queued(
+    queued: ListedVideo,
+    skip: SkipStore,
+    failed: FailStore,
+    client: InstagramClient | None,
+    yt_dlp: list[str] | None,
+    args: argparse.Namespace,
+    stats: RunStats,
+) -> None:
+    if stats.max_reached(args.max):
+        return
+    if skip.known(queued.video_id) or failed.known(queued.video_id):
+        LOG.debug("Already have %s", queued.video_id)
+        stats.record("skipped")
+        return
+    try:
+        video = refresh_queued_video(queued, client)
+    except InstagramError as exc:
+        LOG.error("%s [%s]", exc, exc.code)
+        if exc.code == "media_not_found":
+            failed.remember(queued.video_id)
+        stats.record("failed")
+        return
+    if args.dry_run:
+        LOG.info("Would download %s", video.url)
+        stats.record("listed")
+        return
+    if download_listed(video, video.url, skip, client, yt_dlp, args):
+        stats.record("downloaded")
+    else:
+        failed.remember(queued.video_id)
+        stats.record("failed")
+
+
+def refresh_queued_video(queued: ListedVideo, client: InstagramClient | None) -> ListedVideo:
+    if client is None:
+        return queued
+    fresh = listed_from_direct(
+        DirectMedia(url=queued.url, video_id=queued.video_id),
+        client,
+    )
+    if fresh is None:
+        raise InstagramError("media_not_found", f"No video found for {queued.url}")
+    username = queued.username if queued.username != "instagram" else fresh.username
+    kind = queued.kind if queued.kind in {"reels", "feed"} else fresh.kind
+    return ListedVideo(
+        video_id=fresh.video_id,
+        url=fresh.url,
+        username=username,
+        kind=kind,
+        taken_at=fresh.taken_at or queued.taken_at,
+        pinned=queued.pinned or fresh.pinned,
+        file_urls=fresh.file_urls,
+    )
 
 
 def download_listed(
@@ -1186,7 +1701,8 @@ def download_listed(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Download Instagram videos from profiles listed in a text file. "
+            "Download Instagram videos. Profile listing is --discover-only "
+            "(writes --queue); downloads are --from-queue or direct reel/post URLs. "
             "Skips videos already in the download archive or output folder."
         )
     )
@@ -1241,7 +1757,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         metavar="N",
-        help="Stop after N new downloads this run (0 = unlimited)",
+        help="Stop after N new queue rows (--discover-only) or N new downloads (0 = unlimited)",
     )
     parser.add_argument(
         "--retries",
@@ -1253,8 +1769,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--request-sleep",
         type=float,
-        default=1.5,
-        help="Seconds to wait between Instagram listing requests (±25%% jitter)",
+        default=6.0,
+        help="Seconds to wait between Instagram listing requests (±25%% jitter; gallery-dl uses 6-12)",
     )
     parser.add_argument(
         "--ig-app-id",
@@ -1291,6 +1807,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List URLs that would be downloaded without writing files",
     )
+    parser.add_argument(
+        "--discover-only",
+        action="store_true",
+        help="List profiles into --queue (JSONL); do not download MP4s",
+    )
+    parser.add_argument(
+        "--from-queue",
+        action="store_true",
+        help="Download videos from --queue instead of listing --profiles",
+    )
+    parser.add_argument(
+        "--queue",
+        type=Path,
+        default=Path("data/queue.jsonl"),
+        help="JSONL queue written by --discover-only and read by --from-queue",
+    )
+    parser.add_argument(
+        "--failed",
+        type=Path,
+        default=Path("data/failed.txt"),
+        help="IDs that failed CDN/download; skipped on later --from-queue runs",
+    )
     return parser
 
 
@@ -1300,15 +1838,70 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.max < 0 or args.retries < 0:
             raise InstagramError("invalid_args", "--max and --retries must be >= 0")
-        entries = parse_profile_file(args.profiles)
+        if args.discover_only and args.from_queue:
+            raise InstagramError(
+                "invalid_args",
+                "Use either --discover-only or --from-queue, not both",
+            )
         yt_dlp = maybe_yt_dlp(args)
         skip = SkipStore(args.archive, args.out)
         skip.load()
+        stats = RunStats()
+        if args.from_queue:
+            queued = load_queue_file(args.queue)
+            failed = FailStore(args.failed)
+            failed.load()
+            pending = [
+                video
+                for video in queued
+                if not skip.known(video.video_id) and not failed.known(video.video_id)
+            ]
+            already = len(queued) - len(pending)
+            if already:
+                LOG.info("Skipping %s already-done or previously-failed queue rows", already)
+                stats.skipped += already
+            if not pending:
+                LOG.info("Queue has nothing left to download")
+                stats.log_summary()
+                return stats.exit_code()
+            client = maybe_client(args, pending)
+            for video in pending:
+                if stats.max_reached(args.max):
+                    LOG.info("Reached --max %s", args.max)
+                    break
+                process_queued(video, skip, failed, client, yt_dlp, args, stats)
+            stats.log_summary()
+            return stats.exit_code()
+        entries = parse_profile_file(args.profiles)
         cursors = CursorStore(args.cursors) if args.full else None
         if cursors is not None:
             cursors.load()
         client = maybe_client(args, entries, cursors)
-        stats = RunStats()
+        if args.discover_only:
+            queue = QueueStore(args.queue)
+            queue.load()
+            for entry in entries:
+                if stats.max_reached(args.max):
+                    LOG.info("Reached --max %s", args.max)
+                    break
+                if isinstance(entry, DirectMedia):
+                    video = listed_from_media_url(entry)
+                    if video is None:
+                        continue
+                    if queue.known(video.video_id):
+                        stats.record("skipped")
+                        continue
+                    if queue.append(video):
+                        LOG.info("Queued %s", video.url)
+                        stats.record("listed")
+                    continue
+                if client is None:
+                    raise InstagramError("cookies_required", "Profile listing needs cookies")
+                discover_profile(entry, skip, queue, client, args, stats)
+            if stats.listed == 0 and not args.queue.is_file():
+                LOG.warning("Queue file was not created because nothing was enqueued")
+            stats.log_summary()
+            return stats.exit_code()
         for entry in entries:
             if stats.max_reached(args.max):
                 LOG.info("Reached --max %s", args.max)
@@ -1316,16 +1909,17 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(entry, DirectMedia):
                 process_direct(entry, skip, client, yt_dlp, args, stats)
                 continue
-            if client is None:
-                raise InstagramError("cookies_required", "Profile listing needs cookies")
-            process_profile(entry, skip, client, yt_dlp, args, stats)
+            LOG.warning(
+                "Skipping @%s — profile listing is --discover-only; download with --from-queue",
+                entry.username,
+            )
         stats.log_summary()
         return stats.exit_code()
     except InstagramError as exc:
         LOG.error("%s [%s]", exc, exc.code)
         return 1
     except KeyboardInterrupt:
-        LOG.warning("Interrupted — progress so far is kept in archive and cursors")
+        LOG.warning("Interrupted — progress so far is kept in archive, queue, and cursors")
         return 130
 
 
@@ -1354,12 +1948,17 @@ def maybe_yt_dlp(args: argparse.Namespace) -> list[str] | None:
 
 def maybe_client(
     args: argparse.Namespace,
-    entries: list[Entry],
-    cursors: CursorStore | None,
+    entries: list[Entry] | list[ListedVideo],
+    cursors: CursorStore | None = None,
 ) -> InstagramClient | None:
-    needs_client = args.downloader == "native" or any(
-        isinstance(entry, Profile) for entry in entries
-    )
+    if args.from_queue:
+        needs_client = args.downloader == "native" and bool(entries)
+    elif args.discover_only:
+        needs_client = any(isinstance(entry, Profile) for entry in entries)
+    else:
+        needs_client = args.downloader == "native" and any(
+            isinstance(entry, DirectMedia) for entry in entries
+        )
     if not needs_client:
         return None
     return InstagramClient(

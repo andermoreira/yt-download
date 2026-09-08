@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gzip
 import json
 import logging
@@ -21,7 +22,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from http.cookiejar import Cookie, MozillaCookieJar
+from http.cookiejar import Cookie, CookieJar, MozillaCookieJar
 from pathlib import Path
 from typing import BinaryIO, TypeVar, Union
 
@@ -83,8 +84,13 @@ RESERVED_PATHS = {
 }
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mkv", ".mov"}
-RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504})
+# 401/403 are often GraphQL WAF or "please wait" throttle, not a dead session.
+RETRYABLE_HTTP = frozenset({401, 403, 429, 500, 502, 503, 504})
 CDN_HOST_RE = re.compile(r"^(?:[a-z0-9-]+\.)*(?:cdninstagram\.com|fbcdn\.net)$")
+RATE_LIMIT_MARKERS = ("please wait a few minutes", "too many requests")
+AUTH_FAIL_MESSAGES = frozenset(
+    {"login_required", "checkpoint_required", "challenge_required"}
+)
 
 
 class InstagramError(Exception):
@@ -168,15 +174,55 @@ def read_decoded_response(resp: object) -> tuple[str, str]:
 
 
 class InstagramRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Do not follow bounces to login/home — urllib would turn POST /clips/user/ into GET /."""
+    """Do not follow login, or API bounces to home (urllib would turn POST /clips/user/ into GET /).
+
+    GET / often 302s to /#; that home→home hop must be followed or the session never warms up.
+    """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
         path = urllib.parse.urlparse(newurl).path.lower()
-        if path.startswith("/accounts/login") or path.startswith("/challenge") or is_instagram_home(
-            newurl
-        ):
+        if path.startswith("/accounts/login") or path.startswith("/challenge"):
+            return None
+        if is_instagram_home(newurl) and not is_instagram_home(req.full_url):
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def instagram_sessionid_cookies(jar: CookieJar) -> list[Cookie]:
+    return [
+        cookie
+        for cookie in jar
+        if cookie.name == "sessionid"
+        and "instagram.com" in (cookie.domain or "")
+        and cookie.value
+    ]
+
+
+def restore_instagram_sessionid(jar: CookieJar, saved: list[Cookie]) -> None:
+    """Instagram 401 throttle responses Set-Cookie-clear sessionid; keep the exported one."""
+    if saved and not instagram_sessionid_cookies(jar):
+        for cookie in saved:
+            jar.set_cookie(cookie)
+
+
+def normalize_netscape_session_cookies(jar: CookieJar) -> None:
+    """Chrome Netscape dumps use expires=0 for session cookies; Python treats 0 as already expired."""
+    for cookie in jar:
+        if cookie.expires == 0:
+            cookie.expires = None
+            cookie.discard = True
+
+
+class PreserveInstagramSessionProcessor(urllib.request.HTTPCookieProcessor):
+    def http_response(self, request, response):  # type: ignore[no-untyped-def]
+        saved = [copy.copy(cookie) for cookie in instagram_sessionid_cookies(self.cookiejar)]
+        code = response.getcode() if hasattr(response, "getcode") else 0
+        if code == 200:
+            response = super().http_response(request, response)
+        restore_instagram_sessionid(self.cookiejar, saved)
+        return response
+
+    https_response = http_response
 
 
 def looks_like_login_page(final_url: str, body: str = "", *, request_url: str = "") -> bool:
@@ -186,30 +232,63 @@ def looks_like_login_page(final_url: str, body: str = "", *, request_url: str = 
     return "/accounts/login" in path or "/challenge" in path
 
 
+def read_http_error_body(exc: urllib.error.HTTPError) -> tuple[str, str]:
+    try:
+        return read_decoded_response(exc)
+    except (OSError, AttributeError, ValueError):
+        return "", exc.geturl() if hasattr(exc, "geturl") else ""
+
+
+def error_from_fail_message(message: str, *, http_status: int | None = None) -> InstagramError:
+    """Map Instagram JSON `status: fail` to throttle vs real login vs generic API error."""
+    text = message.lower()
+    if any(marker in text for marker in RATE_LIMIT_MARKERS):
+        return InstagramError("instagram_http", message, http_status=429)
+    if text in AUTH_FAIL_MESSAGES:
+        return InstagramError(
+            "instagram_auth_required",
+            "Instagram asked for login. Refresh cookies and retry.",
+            http_status=http_status,
+        )
+    return InstagramError("instagram_api", message, http_status=http_status)
+
+
+def is_rate_limit(exc: InstagramError) -> bool:
+    """True for Instagram throttle (please-wait / 429), not a dead session."""
+    if exc.http_status == 429:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in RATE_LIMIT_MARKERS)
+
+
 def raise_for_instagram_http(exc: urllib.error.HTTPError, *, request_url: str) -> None:
     retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
     location = exc.headers.get("Location") if exc.headers else None
     dest = urllib.parse.urljoin(request_url, location or "")
-    if exc.code in {401, 403}:
+    body, final_url = read_http_error_body(exc)
+    if final_url:
+        dest = dest or final_url
+    if looks_like_login_page(dest, body, request_url=request_url):
         raise InstagramError(
             "instagram_auth_required",
-            "Instagram asked for login. Refresh cookies and retry.",
+            f"Instagram redirected to a login/challenge page ({dest}).",
             http_status=exc.code,
         ) from exc
-    if exc.code in {301, 302, 303, 307, 308}:
-        if looks_like_login_page(dest):
-            raise InstagramError(
-                "instagram_auth_required",
-                f"Instagram redirected to a login/challenge page ({dest}).",
-                http_status=exc.code,
-            ) from exc
-        if is_instagram_home(dest):
-            raise InstagramError(
-                "instagram_http",
-                "Instagram redirected to home (rate-limit)",
-                http_status=429,
-                retry_after=retry_after,
-            ) from exc
+    try:
+        payload = json.loads(body) if body else None
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        message = str(payload.get("message") or "")
+        if message:
+            raise error_from_fail_message(message, http_status=exc.code) from exc
+    if is_instagram_home(dest) and not is_instagram_home(request_url):
+        raise InstagramError(
+            "instagram_http",
+            "Instagram redirected to home (rate-limit)",
+            http_status=429,
+            retry_after=retry_after,
+        ) from exc
     raise InstagramError(
         "instagram_http",
         f"Instagram HTTP {exc.code}",
@@ -349,6 +428,8 @@ def parse_retry_after(raw: str | None) -> float | None:
 
 
 def is_retryable(exc: InstagramError) -> bool:
+    if exc.code == "instagram_auth_required":
+        return False
     if exc.code == "instagram_network":
         return True
     return exc.http_status in RETRYABLE_HTTP
@@ -770,6 +851,7 @@ class InstagramClient:
                 "cookies_invalid",
                 f"Could not read cookies file {cookies_path}: {exc}",
             ) from exc
+        normalize_netscape_session_cookies(self._jar)
         if not any(cookie.name == "sessionid" for cookie in self._jar):
             raise InstagramError(
                 "cookies_required",
@@ -801,7 +883,7 @@ class InstagramClient:
         self._ensure_csrf()
         self._opener = urllib.request.build_opener(
             InstagramRedirectHandler(),
-            urllib.request.HTTPCookieProcessor(self._jar),
+            PreserveInstagramSessionProcessor(self._jar),
         )
 
     def _ensure_csrf(self) -> None:
@@ -856,29 +938,9 @@ class InstagramClient:
         return headers
 
     def _bootstrap_session(self) -> None:
-        """GET / so Instagram can set x-ig-set-www-claim before API calls."""
-        if self._bootstrapped:
-            return
+        # GET / Set-Cookie-clears sessionid (same class of bug as hitting IG_ORIGIN
+        # during cookie dump). www-claim is taken from later API response headers.
         self._bootstrapped = True
-        home = f"{IG_ORIGIN}/"
-        req = urllib.request.Request(home, headers=self._headers())
-        try:
-            with self._opener.open(req, timeout=30) as resp:
-                claim = resp.headers.get("x-ig-set-www-claim")
-                if claim:
-                    self._www_claim = claim
-                body, final_url = read_decoded_response(resp)
-        except urllib.error.HTTPError as exc:
-            raise_for_instagram_http(exc, request_url=home)
-        except urllib.error.URLError as exc:
-            raise InstagramError("instagram_network", f"Network error: {exc.reason}") from exc
-        self._requests_made += 1
-        if looks_like_login_page(final_url, body, request_url=home):
-            raise InstagramError(
-                "instagram_auth_required",
-                "Instagram redirected to a login/challenge page "
-                f"({final_url}). Log in on the browser, close it, and export cookies again.",
-            )
 
     def _request(
         self,
@@ -942,9 +1004,9 @@ class InstagramClient:
                 ) from exc
             raise InstagramError("instagram_api", "Instagram returned a non-JSON response") from exc
         if isinstance(payload, dict) and payload.get("status") == "fail":
-            message = str(payload.get("message") or "request failed")
-            code = "instagram_auth_required" if "login" in message.lower() else "instagram_api"
-            raise InstagramError(code, message)
+            raise error_from_fail_message(
+                str(payload.get("message") or "request failed"),
+            )
         return payload
 
     def user_id(self, username: str) -> str:
@@ -1044,6 +1106,7 @@ class InstagramClient:
             form={
                 "doc_id": doc_id,
                 "variables": json.dumps(variables, separators=(",", ":")),
+                "server_timestamps": "true",
             },
         )
 
@@ -1175,14 +1238,19 @@ class InstagramClient:
         try:
             return self._media_by_shortcode_graphql(shortcode)
         except InstagramError as exc:
-            if exc.code in {"instagram_auth_required", "invalid_entry"}:
+            if exc.code in {"instagram_auth_required", "invalid_entry"} or is_rate_limit(exc):
                 raise
             LOG.warning(
                 "GraphQL media failed for %s [%s]; trying REST",
                 shortcode,
                 exc.code,
             )
-            return self._media_by_shortcode_rest(shortcode)
+            try:
+                return self._media_by_shortcode_rest(shortcode)
+            except InstagramError as rest_exc:
+                if rest_exc.code == "instagram_auth_required" and exc.code == "instagram_http":
+                    raise exc from rest_exc
+                raise
 
     def _media_by_shortcode_rest(self, shortcode: str) -> dict:
         pk = shortcode_to_pk(shortcode)
@@ -1498,6 +1566,8 @@ def process_direct(
     try:
         video = listed_from_direct(entry, client)
     except InstagramError as exc:
+        if is_rate_limit(exc) or exc.code == "instagram_auth_required":
+            raise
         LOG.error("%s [%s]", exc, exc.code)
         stats.record("failed")
         return "failed"
@@ -1625,6 +1695,8 @@ def process_queued(
     try:
         video = refresh_queued_video(queued, client)
     except InstagramError as exc:
+        if exc.code == "instagram_auth_required" or is_rate_limit(exc):
+            raise
         LOG.error("%s [%s]", exc, exc.code)
         if exc.code == "media_not_found":
             failed.remember(queued.video_id)
@@ -1757,14 +1829,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         metavar="N",
-        help="Stop after N new queue rows (--discover-only) or N new downloads (0 = unlimited)",
+        help="Stop after N new queue rows (--discover-only) or N successful downloads (0 = unlimited; failures do not count)",
     )
     parser.add_argument(
         "--retries",
         type=int,
         default=3,
         metavar="N",
-        help="Retries for 429/5xx/network errors (default: 3)",
+        help="Retries for 429, 401/403 throttle, 5xx, and network errors (default: 3)",
     )
     parser.add_argument(
         "--request-sleep",
@@ -1844,6 +1916,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Use either --discover-only or --from-queue, not both",
             )
         yt_dlp = maybe_yt_dlp(args)
+        if cookies_export_only(args):
+            LOG.info("Wrote cookies to %s", args.cookies)
+            return 0
         skip = SkipStore(args.archive, args.out)
         skip.load()
         stats = RunStats()
@@ -1921,6 +1996,19 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         LOG.warning("Interrupted — progress so far is kept in archive, queue, and cursors")
         return 130
+
+
+def cookies_export_only(args: argparse.Namespace) -> bool:
+    """True when --cookies-from-browser was the job (no queue/discover, no reel URLs)."""
+    if not args.cookies_from_browser or args.from_queue or args.discover_only:
+        return False
+    if not args.profiles.is_file():
+        return True
+    try:
+        entries = parse_profile_file(args.profiles)
+    except InstagramError:
+        return True
+    return not any(isinstance(entry, DirectMedia) for entry in entries)
 
 
 def maybe_yt_dlp(args: argparse.Namespace) -> list[str] | None:

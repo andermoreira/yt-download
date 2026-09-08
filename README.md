@@ -9,7 +9,7 @@ Há dois passos separados, no mesmo espírito do gallery-dl (extractor vs downlo
 
 Por padrão **não usa yt-dlp**: o download nativo pede o MP4 no CDN. yt-dlp continua opcional (`--downloader yt-dlp`) e também serve só para exportar cookies do browser.
 
-A listagem REST de perfil (`clips/user`, `feed/user`) frequentemente responde **429**. O discover usa GraphQL da web (o mesmo caminho do instaloader) e cai no REST se o GraphQL falhar. URLs diretas de reel/post usam `media/info` e costumam funcionar.
+A listagem REST de perfil (`clips/user`, `feed/user`) frequentemente responde **429**. O discover usa GraphQL da web (o mesmo caminho do instaloader) e cai no REST se o GraphQL falhar. `--from-queue` pede o MP4 via GraphQL primeiro; REST `media/info` é fallback quando o GraphQL falha por motivo que não seja throttle.
 
 ## Setup
 
@@ -26,7 +26,7 @@ O Instagram exige sessão logada. Duas formas:
 python3 download_instagram.py --cookies-from-browser chrome
 ```
 
-O dump **não** acessa o Instagram (o extractor do yt-dlp está quebrado e essa request pode invalidar a sessão). O User-Agent padrão é Chrome 152 — se o browser for outra major, passe `--user-agent` ou `IG_USER_AGENT`.
+O dump **não** acessa o Instagram (o extractor do yt-dlp está quebrado e essa request pode invalidar a sessão). Sem `--from-queue` nem `--discover-only` (e sem URL de reel/post em `profiles.txt`), o comando **só** grava `cookies.txt` e sai. O User-Agent padrão é Chrome 152 — se o browser for outra major, passe `--user-agent` ou `IG_USER_AGENT`.
 
 ## Uso
 
@@ -89,7 +89,7 @@ python3 download_instagram.py --discover-only --full
 
 `--full` salva a posição da paginação em `data/cursors.json` depois de cada página. Se a varredura for interrompida (Ctrl+C sai com código 130, `--max`, crash), a próxima `--full` do mesmo perfil retoma do ponto salvo. Quando uma aba termina naturalmente, o cursor dela é apagado. Varreduras sem `--full` ignoram cursors; para recomeçar do topo, apague o arquivo.
 
-Ao terminar, o script imprime `downloaded / skipped / failed` (e `listed` quando enfileirou ou fez dry-run) e sai com código `1` se algum download falhou. 429 e erros de rede tentam de novo (padrão: 3 retries). Linhas inválidas em `profiles.txt` ou na fila são puladas com warning — não abortam a execução.
+Ao terminar, o script imprime `downloaded / skipped / failed` (e `listed` quando enfileirou ou fez dry-run) e sai com código `1` se algum download falhou. 429, 401 *please wait*, 403 e erros de rede tentam de novo (padrão: 3 retries). `--max` conta só downloads (ou linhas novas na fila) com sucesso — falha não entra na conta. Linhas inválidas em `profiles.txt` ou na fila são puladas com warning — não abortam a execução. Throttle persistente (*please wait*) **para a fila** para não martelar o limite; espere alguns minutos e rode de novo.
 
 ## Metadados
 
@@ -123,5 +123,6 @@ python3 download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 - Cookies de conta logada em automação podem levar a bloqueio. Prefira uma sessão que você aceite perder.
 - Não commite `cookies.txt`. O script aplica chmod 600 nele (export do browser e leitura).
 - O app-id do Instagram muda de vez em quando. Se os endpoints começarem a falhar em massa, atualize com `--ig-app-id` ou a env `IG_APP_ID`.
-- Se o Instagram responder login/rate-limit, atualize os cookies e aumente `--request-sleep` (que já vai com ±25% de jitter; o padrão é 6s). O download usa GraphQL quando o REST `media/info` estiver em 429.
+- `"Please wait a few minutes"` é throttle: o script retenta e, se persistir, **para**. Espere de verdade alguns minutos (não só os retries de 8–32s) e rode `--from-queue` de novo. Aumente `--request-sleep` se o limite voltar rápido.
+- Redirect para `/accounts/login` é sessão morta. Exporte cookies de novo (`--cookies-from-browser chrome`, Chrome fechado).
 - `--discover-only` em `profiles.txt` de usernames usa GraphQL para listar. Se o Meta rotacionar os `doc_id`, a listagem pode quebrar até atualizar o script.

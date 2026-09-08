@@ -4,7 +4,11 @@ import os
 import tempfile
 import unittest
 import unittest.mock
+import urllib.error
 import urllib.request
+from copy import copy
+from email.message import Message
+from io import BytesIO
 from pathlib import Path
 
 import download_instagram as ig
@@ -76,6 +80,12 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(
             handler.redirect_request(
                 req, None, 302, "Found", {}, "https://www.instagram.com/accounts/login/"
+            )
+        )
+        home = urllib.request.Request("https://www.instagram.com/")
+        self.assertIsNotNone(
+            handler.redirect_request(
+                home, None, 302, "Found", {}, "https://www.instagram.com/#"
             )
         )
 
@@ -277,6 +287,12 @@ class RetryTests(unittest.TestCase):
         self.assertTrue(
             ig.is_retryable(ig.InstagramError("instagram_http", "x", http_status=429))
         )
+        self.assertTrue(
+            ig.is_retryable(ig.InstagramError("instagram_http", "x", http_status=403))
+        )
+        self.assertTrue(
+            ig.is_retryable(ig.InstagramError("instagram_http", "x", http_status=401))
+        )
         self.assertFalse(
             ig.is_retryable(ig.InstagramError("instagram_http", "x", http_status=404))
         )
@@ -285,6 +301,58 @@ class RetryTests(unittest.TestCase):
     def test_backoff_prefers_retry_after(self) -> None:
         self.assertEqual(ig.backoff_seconds(0, 1.5, 12.0), 12.0)
         self.assertEqual(ig.backoff_seconds(2, 1.5, None), 6.0)
+
+    def test_please_wait_401_is_retryable_not_login(self) -> None:
+        err = ig.error_from_fail_message(
+            "Please wait a few minutes before you try again.",
+            http_status=401,
+        )
+        self.assertEqual(err.code, "instagram_http")
+        self.assertEqual(err.http_status, 429)
+        self.assertTrue(ig.is_retryable(err))
+        self.assertTrue(ig.is_rate_limit(err))
+        login = ig.error_from_fail_message("login_required", http_status=401)
+        self.assertEqual(login.code, "instagram_auth_required")
+        self.assertFalse(ig.is_retryable(login))
+        self.assertFalse(ig.is_rate_limit(login))
+
+    def test_raise_for_instagram_http_reads_401_json(self) -> None:
+        payload = {
+            "message": "Please wait a few minutes before you try again.",
+            "require_login": True,
+            "status": "fail",
+        }
+        hdrs = Message()
+        hdrs["Content-Type"] = "application/json; charset=utf-8"
+        exc = urllib.error.HTTPError(
+            "https://www.instagram.com/graphql/query",
+            401,
+            "Unauthorized",
+            hdrs,
+            BytesIO(json.dumps(payload).encode()),
+        )
+        with self.assertRaises(ig.InstagramError) as raised:
+            ig.raise_for_instagram_http(
+                exc, request_url="https://www.instagram.com/graphql/query"
+            )
+        self.assertEqual(raised.exception.code, "instagram_http")
+        self.assertEqual(raised.exception.http_status, 429)
+
+    def test_raise_for_instagram_http_login_redirect(self) -> None:
+        hdrs = Message()
+        hdrs["Location"] = "https://www.instagram.com/accounts/login/?next=/api/v1/media/1/info/"
+        exc = urllib.error.HTTPError(
+            "https://www.instagram.com/api/v1/media/1/info/",
+            302,
+            "Found",
+            hdrs,
+            BytesIO(b""),
+        )
+        with self.assertRaises(ig.InstagramError) as raised:
+            ig.raise_for_instagram_http(
+                exc, request_url="https://www.instagram.com/api/v1/media/1/info/"
+            )
+        self.assertEqual(raised.exception.code, "instagram_auth_required")
 
     def test_should_stop_after_existing(self) -> None:
         self.assertTrue(ig.should_stop_after_existing(3, full=False, threshold=3))
@@ -495,6 +563,34 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(headers["X-ASBD-ID"], "359341")
             self.assertEqual(headers["Sec-CH-UA-Mobile"], "?0")
             self.assertEqual(headers["Sec-CH-UA-Platform"], '"macOS"')
+
+    def test_restore_instagram_sessionid_after_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            self.make_cookies(cookies)
+            client = ig.InstagramClient(cookies, 0.0)
+            saved = [copy(c) for c in ig.instagram_sessionid_cookies(client._jar)]
+            self.assertTrue(saved)
+            for cookie in list(client._jar):
+                if cookie.name == "sessionid":
+                    client._jar.clear(cookie.domain, cookie.path, cookie.name)
+            self.assertFalse(ig.instagram_sessionid_cookies(client._jar))
+            ig.restore_instagram_sessionid(client._jar, saved)
+            self.assertTrue(ig.instagram_sessionid_cookies(client._jar))
+
+    def test_normalize_zero_expiry_session_cookies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cookies.txt"
+            path.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t0\trur\tPRN\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\tabc\n",
+                encoding="utf-8",
+            )
+            client = ig.InstagramClient(path, 0.0)
+            rur = next(cookie for cookie in client._jar if cookie.name == "rur")
+            self.assertIsNone(rur.expires)
+            self.assertTrue(rur.discard)
 
     def test_init_rejects_missing_sessionid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -736,6 +832,43 @@ class QueueTests(unittest.TestCase):
             rows = [json.loads(line) for line in queue.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(rows[0]["id"], "CSIeW8lg-Pd")
 
+    def test_cookies_from_browser_without_queue_only_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "profiles.txt"
+            profiles.write_text("andres.ague\njohnny.guitars\n", encoding="utf-8")
+            cookies = root / "cookies.txt"
+            with unittest.mock.patch.object(ig, "find_yt_dlp", return_value=["yt-dlp"]):
+                with unittest.mock.patch.object(ig, "export_browser_cookies") as export:
+                    with unittest.mock.patch.object(
+                        ig, "InstagramClient", side_effect=AssertionError("must not start a run")
+                    ):
+                        code = ig.main(
+                            [
+                                "--cookies-from-browser",
+                                "chrome",
+                                "--profiles",
+                                str(profiles),
+                                "--cookies",
+                                str(cookies),
+                                "--out",
+                                str(root / "downloads"),
+                                "--archive",
+                                str(root / "archive.txt"),
+                            ]
+                        )
+            self.assertEqual(code, 0)
+            export.assert_called_once()
+
+    def test_cookies_export_only_false_when_from_queue(self) -> None:
+        args = unittest.mock.Mock(
+            cookies_from_browser="chrome",
+            from_queue=True,
+            discover_only=False,
+            profiles=Path("profiles.txt"),
+        )
+        self.assertFalse(ig.cookies_export_only(args))
+
     def test_from_queue_dry_run_skips_archived(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -797,6 +930,34 @@ class QueueTests(unittest.TestCase):
                     media = client.media_by_shortcode("Czdv17nrnpR")
             self.assertEqual(media["code"], "Czdv17nrnpR")
             self.assertTrue(ig.video_urls_from_media(media))
+
+    def test_media_by_shortcode_does_not_hit_rest_on_throttle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            cookies.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\tabc\n",
+                encoding="utf-8",
+            )
+            client = ig.InstagramClient(cookies, 0.0, retries=0)
+
+            def gql_fail(_shortcode: str) -> dict:
+                raise ig.InstagramError(
+                    "instagram_http",
+                    "Please wait a few minutes before you try again.",
+                    http_status=429,
+                )
+
+            with unittest.mock.patch.object(client, "_media_by_shortcode_graphql", gql_fail):
+                with unittest.mock.patch.object(
+                    client,
+                    "_media_by_shortcode_rest",
+                    side_effect=AssertionError("REST skipped on throttle"),
+                ):
+                    with self.assertRaises(ig.InstagramError) as raised:
+                        client.media_by_shortcode("Czdv17nrnpR")
+            self.assertEqual(raised.exception.code, "instagram_http")
+            self.assertTrue(ig.is_rate_limit(raised.exception))
 
 
 if __name__ == "__main__":

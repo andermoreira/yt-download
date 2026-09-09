@@ -265,6 +265,23 @@ class MediaTests(unittest.TestCase):
             ],
         )
 
+    def test_download_native_pairs_urls_without_zip_strict(self) -> None:
+        video = ig.ListedVideo(
+            video_id="CSIeW8lg-Pd",
+            url="https://www.instagram.com/andres.ague/reel/CSIeW8lg-Pd/",
+            username="andres.ague",
+            kind="reels",
+            taken_at=1626307200,
+            pinned=False,
+            file_urls=("https://cdn.example/a.mp4", "https://cdn.example/b.mp4"),
+        )
+        client = unittest.mock.Mock()
+        client.download_url.return_value = True
+        with tempfile.TemporaryDirectory() as tmp:
+            ok = ig.download_native(client, video, Path(tmp))
+        self.assertTrue(ok)
+        self.assertEqual(client.download_url.call_count, 2)
+
     def test_carousel_filename_seeds_archive_id(self) -> None:
         self.assertEqual(
             ig.video_id_from_filename(Path("2021-07-15_CSIeW8lg-Pd~1.mp4")),
@@ -958,6 +975,64 @@ class QueueTests(unittest.TestCase):
                         client.media_by_shortcode("Czdv17nrnpR")
             self.assertEqual(raised.exception.code, "instagram_http")
             self.assertTrue(ig.is_rate_limit(raised.exception))
+
+    def test_media_by_shortcode_skips_rest_on_graphql_execution_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            cookies.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\tabc\n",
+                encoding="utf-8",
+            )
+            client = ig.InstagramClient(cookies, 0.0, retries=0)
+
+            def gql_payload(_doc_id: str, _variables: dict) -> dict:
+                return {
+                    "status": "ok",
+                    "data": None,
+                    "errors": [
+                        {
+                            "message": "execution error",
+                            "severity": "CRITICAL",
+                            "path": [ig.GQL_MEDIA_CONNECTION],
+                        }
+                    ],
+                }
+
+            with unittest.mock.patch.object(client, "_graphql_query", gql_payload):
+                with unittest.mock.patch.object(
+                    client,
+                    "_media_by_shortcode_rest",
+                    side_effect=AssertionError("REST skipped on GraphQL execution error"),
+                ):
+                    with self.assertRaises(ig.InstagramError) as raised:
+                        client.media_by_shortcode("C1_6xYio5jC")
+            self.assertEqual(raised.exception.code, "media_not_found")
+
+    def test_media_by_shortcode_rest_login_after_graphql_api_is_not_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cookies = Path(tmp) / "cookies.txt"
+            cookies.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\tabc\n",
+                encoding="utf-8",
+            )
+            client = ig.InstagramClient(cookies, 0.0, retries=0)
+
+            def gql_fail(_shortcode: str) -> dict:
+                raise ig.InstagramError("instagram_api", "GraphQL media errors")
+
+            def rest_login(_shortcode: str) -> dict:
+                raise ig.InstagramError(
+                    "instagram_auth_required",
+                    "Instagram redirected to a login/challenge page.",
+                )
+
+            with unittest.mock.patch.object(client, "_media_by_shortcode_graphql", gql_fail):
+                with unittest.mock.patch.object(client, "_media_by_shortcode_rest", rest_login):
+                    with self.assertRaises(ig.InstagramError) as raised:
+                        client.media_by_shortcode("C1_6xYio5jC")
+            self.assertEqual(raised.exception.code, "media_not_found")
 
 
 if __name__ == "__main__":

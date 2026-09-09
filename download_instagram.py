@@ -1238,7 +1238,10 @@ class InstagramClient:
         try:
             return self._media_by_shortcode_graphql(shortcode)
         except InstagramError as exc:
-            if exc.code in {"instagram_auth_required", "invalid_entry"} or is_rate_limit(exc):
+            if (
+                exc.code in {"instagram_auth_required", "invalid_entry", "media_not_found"}
+                or is_rate_limit(exc)
+            ):
                 raise
             LOG.warning(
                 "GraphQL media failed for %s [%s]; trying REST",
@@ -1248,8 +1251,15 @@ class InstagramClient:
             try:
                 return self._media_by_shortcode_rest(shortcode)
             except InstagramError as rest_exc:
-                if rest_exc.code == "instagram_auth_required" and exc.code == "instagram_http":
+                if rest_exc.code == "instagram_auth_required" and (
+                    exc.code == "instagram_http" or is_rate_limit(exc)
+                ):
                     raise exc from rest_exc
+                if rest_exc.code == "instagram_auth_required":
+                    raise InstagramError(
+                        "media_not_found",
+                        f"No media for {shortcode}",
+                    ) from rest_exc
                 raise
 
     def _media_by_shortcode_rest(self, shortcode: str) -> dict:
@@ -1268,9 +1278,13 @@ class InstagramClient:
                 "__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider": False,
             },
         )
-        if data.get("errors") and not (data.get("data") or {}).get(GQL_MEDIA_CONNECTION):
-            raise InstagramError("instagram_api", f"GraphQL media errors for {shortcode}")
-        info = (data.get("data") or {}).get(GQL_MEDIA_CONNECTION) or {}
+        connection = (data.get("data") or {}).get(GQL_MEDIA_CONNECTION)
+        if data.get("errors") and not connection:
+            # status=ok + execution error + null data: this shortcode is gone or
+            # blocked. REST /media/{pk}/info/ often 302s to login, which would
+            # abort the whole --from-queue run as instagram_auth_required.
+            raise InstagramError("media_not_found", f"No media for {shortcode}")
+        info = connection or {}
         items = info.get("items") or []
         if not items:
             raise InstagramError("media_not_found", f"No media for {shortcode}")
@@ -1479,8 +1493,11 @@ def download_native(
         LOG.warning("No CDN URL for %s", video.video_id)
         return False
     LOG.info("Downloading %s", video.url)
+    dests = native_destinations(download_dir, video)
+    if len(dests) != len(video.file_urls):
+        raise ValueError("CDN URL count does not match destination count")
     try:
-        for url, dest in zip(video.file_urls, native_destinations(download_dir, video), strict=True):
+        for url, dest in zip(video.file_urls, dests):
             fetched = client.download_url(url, dest)
             sidecar = dest.parent / (dest.name + ".json")
             if write_metadata and (fetched or not sidecar.exists()):

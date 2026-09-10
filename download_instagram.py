@@ -439,9 +439,14 @@ def backoff_seconds(
     attempt: int,
     request_sleep: float,
     retry_after: float | None,
+    *,
+    rate_limit_sleep: float = 0.0,
+    is_throttle: bool = False,
 ) -> float:
     if retry_after is not None:
-        return min(120.0, retry_after)
+        return min(max(120.0, rate_limit_sleep), retry_after)
+    if is_throttle and rate_limit_sleep > 0:
+        return rate_limit_sleep
     return min(60.0, max(request_sleep, 1.0) * (2 ** attempt))
 
 
@@ -451,6 +456,7 @@ def call_with_retry(
     retries: int,
     request_sleep: float,
     what: str,
+    rate_limit_sleep: float = 0.0,
 ) -> T:
     last_error: InstagramError | None = None
     for attempt in range(retries + 1):
@@ -460,15 +466,32 @@ def call_with_retry(
             last_error = exc
             if not is_retryable(exc) or attempt >= retries:
                 raise
-            delay = backoff_seconds(attempt, request_sleep, exc.retry_after)
-            LOG.warning(
-                "Retry %s/%s for %s in %.1fs [%s]",
-                attempt + 1,
-                retries,
-                what,
-                delay,
-                exc.code,
+            throttle = is_rate_limit(exc)
+            delay = backoff_seconds(
+                attempt,
+                request_sleep,
+                exc.retry_after,
+                rate_limit_sleep=rate_limit_sleep,
+                is_throttle=throttle,
             )
+            if throttle and rate_limit_sleep > 0:
+                LOG.warning(
+                    "Rate limit hit for %s; waiting %.1fs for cooldown before retry %s/%s [%s]",
+                    what,
+                    delay,
+                    attempt + 1,
+                    retries,
+                    exc.code,
+                )
+            else:
+                LOG.warning(
+                    "Retry %s/%s for %s in %.1fs [%s]",
+                    attempt + 1,
+                    retries,
+                    what,
+                    delay,
+                    exc.code,
+                )
             time.sleep(delay)
     assert last_error is not None
     raise last_error
@@ -827,6 +850,7 @@ class InstagramClient:
         app_id: str = IG_WEB_APP_ID,
         user_agent: str = CHROME_UA,
         cursors: CursorStore | None = None,
+        rate_limit_sleep: float = 300.0,
     ) -> None:
         if not cookies_path.is_file():
             raise InstagramError(
@@ -839,6 +863,7 @@ class InstagramClient:
         self.app_id = app_id
         self.user_agent = user_agent
         self.cursors = cursors
+        self.rate_limit_sleep = rate_limit_sleep
         self._www_claim = "0"
         self._requests_made = 0
         self._bootstrapped = False
@@ -955,6 +980,7 @@ class InstagramClient:
             retries=self.retries,
             request_sleep=self.request_sleep,
             what=target,
+            rate_limit_sleep=self.rate_limit_sleep,
         )
 
     def _request_once(
@@ -1302,6 +1328,7 @@ class InstagramClient:
             retries=self.retries,
             request_sleep=self.request_sleep,
             what=dest.name,
+            rate_limit_sleep=self.rate_limit_sleep,
         )
         return True
 
@@ -1862,6 +1889,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait between Instagram listing requests (±25%% jitter; gallery-dl uses 6-12)",
     )
     parser.add_argument(
+        "--rate-limit-sleep",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help=(
+            "Seconds to wait for cooldown when Instagram returns 'Please wait a few minutes' "
+            "or 429 throttle (default: 300.0 / 5 min; set 0 to disable)"
+        ),
+    )
+    parser.add_argument(
         "--ig-app-id",
         default=os.environ.get("IG_APP_ID", IG_WEB_APP_ID),
         help="Instagram web app id sent as X-IG-App-ID (env: IG_APP_ID)",
@@ -2073,6 +2110,7 @@ def maybe_client(
         app_id=args.ig_app_id,
         user_agent=args.user_agent,
         cursors=cursors,
+        rate_limit_sleep=args.rate_limit_sleep,
     )
 
 

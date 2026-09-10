@@ -393,6 +393,53 @@ class RetryTests(unittest.TestCase):
             )
         self.assertEqual(calls["n"], 3)
 
+    def test_backoff_seconds_rate_limit(self) -> None:
+        self.assertEqual(
+            ig.backoff_seconds(0, 1.5, None, rate_limit_sleep=300.0, is_throttle=True),
+            300.0,
+        )
+        self.assertEqual(
+            ig.backoff_seconds(1, 1.5, None, rate_limit_sleep=300.0, is_throttle=False),
+            3.0,
+        )
+        self.assertEqual(
+            ig.backoff_seconds(0, 1.5, None, rate_limit_sleep=0.0, is_throttle=True),
+            1.5,
+        )
+
+    def test_call_with_retry_rate_limit_cooldown(self) -> None:
+        calls = {"n": 0}
+        slept: list[float] = []
+
+        def operation() -> str:
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise ig.InstagramError(
+                    "instagram_http",
+                    "Please wait a few minutes before you try again.",
+                    http_status=429,
+                )
+            return "ok"
+
+        with unittest.mock.patch("download_instagram.time.sleep", side_effect=slept.append):
+            result = ig.call_with_retry(
+                operation,
+                retries=2,
+                request_sleep=1.0,
+                what="graphql",
+                rate_limit_sleep=300.0,
+            )
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(slept, [300.0])
+
+    def test_parser_rate_limit_sleep(self) -> None:
+        parser = ig.build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.rate_limit_sleep, 300.0)
+        custom_args = parser.parse_args(["--rate-limit-sleep", "120"])
+        self.assertEqual(custom_args.rate_limit_sleep, 120.0)
+
 
 class StatsTests(unittest.TestCase):
     def test_exit_code_and_max(self) -> None:

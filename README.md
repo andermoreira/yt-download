@@ -89,7 +89,7 @@ python3 download_instagram.py --discover-only --full
 
 `--full` salva a posição da paginação em `data/cursors.json` depois de cada página. Se a varredura for interrompida (Ctrl+C sai com código 130, `--max`, crash), a próxima `--full` do mesmo perfil retoma do ponto salvo. Quando uma aba termina naturalmente, o cursor dela é apagado. Varreduras sem `--full` ignoram cursors; para recomeçar do topo, apague o arquivo.
 
-Ao terminar, o script imprime `downloaded / skipped / failed` (e `listed` quando enfileirou ou fez dry-run) e sai com código `1` se algum download falhou. 429, 401 *please wait*, 403 e erros de rede tentam de novo (padrão: 3 retries). `--max` conta só downloads (ou linhas novas na fila) com sucesso — falha não entra na conta. Linhas inválidas em `profiles.txt` ou na fila são puladas com warning — não abortam a execução. Throttle persistente (*please wait*) **para a fila** para não martelar o limite; espere alguns minutos e rode de novo.
+Ao terminar, o script imprime `downloaded / skipped / failed` (e `listed` quando enfileirou ou fez dry-run) e sai com código `1` se algum download falhou. 429, 401 *please wait*, 403 e erros de rede tentam de novo (padrão: 3 retries). Ao receber throttle (*please wait* / 429), o script aguarda o tempo de cooldown de `--rate-limit-sleep` (padrão: 300s / 5 minutos) antes da próxima tentativa, permitindo que a fila continue automaticamente. `--max` conta só downloads (ou linhas novas na fila) com sucesso — falha não entra na conta. Linhas inválidas em `profiles.txt` ou na fila são puladas com warning — não abortam a execução.
 
 ## Metadados
 
@@ -112,6 +112,7 @@ python3 download_instagram.py --from-queue --downloader yt-dlp
 python3 download_instagram.py --dry-run --profiles um-reel.txt
 python3 download_instagram.py --discover-only --reels-only --max 20
 python3 download_instagram.py --from-queue --max 20 --retries 5
+python3 download_instagram.py --from-queue --rate-limit-sleep 300
 python3 download_instagram.py --from-queue --write-metadata
 python3 download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 ```
@@ -123,6 +124,6 @@ python3 download_instagram.py --profiles meus-perfis.txt --out ~/Videos/ig
 - Cookies de conta logada em automação podem levar a bloqueio. Prefira uma sessão que você aceite perder.
 - Não commite `cookies.txt`. O script aplica chmod 600 nele (export do browser e leitura).
 - O app-id do Instagram muda de vez em quando. Se os endpoints começarem a falhar em massa, atualize com `--ig-app-id` ou a env `IG_APP_ID`.
-- `"Please wait a few minutes"` é throttle: o script retenta e, se persistir, **para**. Espere de verdade alguns minutos (não só os retries de 8–32s) e rode `--from-queue` de novo. Aumente `--request-sleep` se o limite voltar rápido.
+- `"Please wait a few minutes"` é throttle: por padrão o script entra em cooldown de 5 minutos (`--rate-limit-sleep 300`) e retoma a fila sozinho. Para desligar esse comportamento e abortar de imediato, passe `--rate-limit-sleep 0`. Se o limite voltar com muita frequência, aumente também `--request-sleep` (ex: 10-15s).
 - Redirect para `/accounts/login` é sessão morta. Exporte cookies de novo (`--cookies-from-browser chrome`, Chrome fechado).
 - `--discover-only` em `profiles.txt` de usernames usa GraphQL para listar. Se o Meta rotacionar os `doc_id`, a listagem pode quebrar até atualizar o script.
